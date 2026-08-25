@@ -1,0 +1,276 @@
+package tui
+
+import (
+	"math"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/oppai/puffy/internal/model"
+)
+
+// synthetic builds a session with a known shape: a clean path whose middle hop
+// stalls for a stretch and whose last-but-one hop drops a burst of probes. Both
+// panels should therefore have something to show.
+func synthetic(rounds int) *model.Session {
+	s := &model.Session{
+		Tool: "puffy", Version: "test", Mode: "trace",
+		Target: "example.test", TargetIP: "192.0.2.9", TargetName: "example.test",
+		StartedAt: time.Unix(0, 0), EndedAt: time.Unix(int64(rounds), 0),
+		IntervalMS: 1000, TimeoutMS: 2000, Rounds: rounds,
+	}
+	base := []float64{1.4, 12, 24, 31, 44, 47}
+	for i, b := range base {
+		h := &model.Hop{TTL: i + 1, Addrs: []string{"198.51.100." + string(rune('1'+i))}}
+		h.Final = i == len(base)-1
+		for r := range rounds {
+			sm := model.Sample{Round: r, OffsetMS: float64(r) * 1000, Addr: h.Addrs[0]}
+			// A wave of jitter everywhere, so the chart is not a straight line.
+			v := b + math.Sin(float64(r)/3)*b*0.08
+			switch {
+			case i == 2 && r >= rounds/3 && r < rounds/3+rounds/6:
+				v = b * 5 // the stall
+			case i == 4 && r >= rounds/2 && r < rounds/2+rounds/8:
+				sm.RTTMS = nil // the loss burst
+				h.Samples = append(h.Samples, sm)
+				continue
+			}
+			val := v
+			sm.RTTMS = &val
+			h.Samples = append(h.Samples, sm)
+		}
+		s.Hops = append(s.Hops, h)
+	}
+	s.Analyze()
+	return s
+}
+
+func testScreen(t *testing.T, cols, rows int, dark bool) *Screen {
+	t.Helper()
+	s := NewScreen(os.Stdout, "dark", true, false)
+	if !dark {
+		s.color.dark = false
+	}
+	// Override the probed terminal size so the layout is deterministic.
+	s.tty = false
+	s.cols, s.rows = cols, rows
+	return s
+}
+
+// strip removes ANSI escapes so assertions and width checks see printable text.
+func strip(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			for i < len(s) && s[i] != 'm' {
+				i++
+			}
+			i++ // the 'm'
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+func TestTraceSummaryFitsWidthAndShowsBothPanels(t *testing.T) {
+	s := synthetic(60)
+	v := View{Screen: testScreen(t, 120, 40, true)}
+	lines := v.Summary(s)
+
+	joined := strip(strings.Join(lines, "\n"))
+	for _, want := range []string{
+		"ttl", "host", "loss", "worst", "rtt over time",
+		"packet loss", "latency stalls", "what the graph shows",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("summary is missing %q\n%s", want, joined)
+		}
+	}
+
+	for i, l := range lines {
+		if w := len([]rune(strip(l))); w > 120 {
+			t.Errorf("line %d is %d columns wide, over the 120 available:\n%s", i, w, strip(l))
+		}
+	}
+}
+
+// Every hop row must carry a time series. A row that silently loses its
+// sparkline is the failure that would make the tool useless without erroring.
+func TestTraceRowsAllHaveSparklines(t *testing.T) {
+	s := synthetic(40)
+	v := View{Screen: testScreen(t, 100, 40, true)}
+	lines := v.Summary(s)
+
+	found := 0
+	for _, l := range lines {
+		txt := strip(l)
+		if !strings.HasPrefix(txt, "  ") {
+			continue
+		}
+		if strings.ContainsAny(txt, "▁▂▃▄▅▆▇█×") {
+			found++
+		}
+	}
+	if found < len(s.Hops) {
+		t.Errorf("only %d of %d hops rendered a series\n%s", found, len(s.Hops),
+			strip(strings.Join(lines, "\n")))
+	}
+}
+
+func TestNarrowTerminalStillRenders(t *testing.T) {
+	s := synthetic(30)
+	for _, cols := range []int{40, 60, 80, 200} {
+		v := View{Screen: testScreen(t, cols, 30, true)}
+		lines := v.Live(s)
+		if len(lines) == 0 {
+			t.Fatalf("cols=%d produced no output", cols)
+		}
+		for i, l := range lines {
+			if w := len([]rune(strip(l))); w > cols {
+				t.Errorf("cols=%d: line %d is %d wide:\n%s", cols, i, w, strip(l))
+			}
+		}
+	}
+}
+
+func TestLiveTraceRespectsTerminalHeight(t *testing.T) {
+	s := synthetic(30)
+	for _, rows := range []int{10, 16, 24, 50} {
+		v := View{Screen: testScreen(t, 120, rows, true)}
+		if n := len(v.Live(s)); n > rows {
+			t.Errorf("rows=%d: rendered %d lines, which would scroll the live view", rows, n)
+		}
+	}
+}
+
+func TestPingFrameRendersChartAndLossStrip(t *testing.T) {
+	s := synthetic(60)
+	s.Mode = "ping"
+	s.Hops = s.Hops[len(s.Hops)-1:] // ping is a one-hop session
+	s.Recompute()
+
+	v := View{Screen: testScreen(t, 100, 30, true)}
+	joined := strip(strings.Join(v.Live(s), "\n"))
+	if !strings.Contains(joined, "loss") {
+		t.Errorf("ping frame has no loss row:\n%s", joined)
+	}
+	if !strings.Contains(joined, "rtt ms") {
+		t.Errorf("ping frame has no chart label:\n%s", joined)
+	}
+	// The braille plot must actually contain plotted dots.
+	if !strings.ContainsFunc(joined, func(r rune) bool { return r >= 0x2801 && r <= 0x28ff }) {
+		t.Errorf("ping frame drew no braille marks:\n%s", joined)
+	}
+}
+
+// A hop that never answered must not be scored or drawn as if it had.
+func TestAllTimeoutHopRendersAsUnknown(t *testing.T) {
+	s := synthetic(20)
+	dead := &model.Hop{TTL: 99}
+	for r := range 20 {
+		dead.Samples = append(dead.Samples, model.Sample{Round: r, OffsetMS: float64(r) * 1000})
+	}
+	s.Hops = append(s.Hops, dead)
+	s.Recompute()
+
+	v := View{Screen: testScreen(t, 120, 40, true)}
+	var row string
+	for _, l := range v.Summary(s) {
+		if strings.Contains(strip(l), " 99 ") {
+			row = strip(l)
+			break
+		}
+	}
+	if row == "" {
+		t.Fatal("the unreachable hop was not rendered at all")
+	}
+	if !strings.Contains(row, "*") {
+		t.Errorf("unreachable hop should be labelled *: %q", row)
+	}
+	if !strings.Contains(row, "100.0%") {
+		t.Errorf("unreachable hop should read 100%% loss: %q", row)
+	}
+}
+
+func TestNoColorProducesNoEscapes(t *testing.T) {
+	s := synthetic(30)
+	sc := NewScreen(os.Stdout, "dark", false, true)
+	sc.tty = false
+	sc.cols, sc.rows = 120, 40
+	v := View{Screen: sc}
+	for _, l := range v.Summary(s) {
+		if strings.ContainsRune(l, 0x1b) {
+			t.Fatalf("--no-color still emitted an escape sequence: %q", l)
+		}
+	}
+}
+
+// The heat glyphs must carry the magnitude order on their own, so the panel
+// still reads with colour stripped, in greyscale print, or with any form of
+// colour vision.
+func TestHeatGlyphsAreOrderedWithoutColor(t *testing.T) {
+	sc := NewScreen(os.Stdout, "dark", false, true)
+	c := sc.Color()
+	cells := []model.Cell{
+		{Sent: 10, Lost: 0}, {Sent: 10, Lost: 1}, {Sent: 10, Lost: 3},
+		{Sent: 10, Lost: 6}, {Sent: 10, Lost: 10},
+	}
+	for i := range cells {
+		cells[i].LossPct = float64(cells[i].Lost) / float64(cells[i].Sent) * 100
+	}
+	got := HeatRow(c, cells, HeatLoss, 0)
+	want := "·░▒▓█"
+	if got != want {
+		t.Errorf("heat row = %q, want %q (ordered glyphs, no colour)", got, want)
+	}
+}
+
+func TestSparklineMarksTotalLossDistinctly(t *testing.T) {
+	sc := NewScreen(os.Stdout, "dark", false, true)
+	c := sc.Color()
+	cells := []model.Cell{
+		{Sent: 1, Lost: 0, MaxRTT: 10},
+		{Sent: 1, Lost: 1, LossPct: 100},
+		{Sent: 0},
+		{Sent: 2, Lost: 1, LossPct: 50, MaxRTT: 80},
+	}
+	got := Sparkline(c, cells, 100, 10)
+	if []rune(got)[1] != '×' {
+		t.Errorf("a fully lost bucket should render ×, got %q", got)
+	}
+	if []rune(got)[2] != ' ' {
+		t.Errorf("a bucket with no probes should render blank, got %q", got)
+	}
+}
+
+func TestFmtSpanKeepsSubSecondPrecision(t *testing.T) {
+	cases := map[float64]string{
+		300: "300ms", 1000: "1s", 1500: "1.5s", 36000: "36s", 90000: "1m30s", 7200000: "2h0m",
+	}
+	for in, want := range cases {
+		if got := fmtSpan(in); got != want {
+			t.Errorf("fmtSpan(%v) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Dumping the rendered frames is the only way to check the graphs actually look
+// right; run with: go test ./internal/tui -run Eyeball -v
+func TestEyeball(t *testing.T) {
+	if os.Getenv("PUFFY_EYEBALL") == "" {
+		t.Skip("set PUFFY_EYEBALL=1 to print the rendered frames")
+	}
+	s := synthetic(90)
+	v := View{Screen: testScreen(t, 120, 44, true)}
+	t.Log("\n" + strings.Join(v.Summary(s), "\n"))
+
+	p := synthetic(90)
+	p.Mode = "ping"
+	p.Hops = p.Hops[len(p.Hops)-1:]
+	p.Recompute()
+	pv := View{Screen: testScreen(t, 110, 30, true)}
+	t.Log("\n" + strings.Join(pv.Live(p), "\n"))
+}

@@ -1,0 +1,18 @@
+# Built binary
+/puffy
+/puffy.exe
+
+# Sessions and reports written into the working directory by a local run
+/*.json
+/*.html
+
+# Build and demo output
+/out/
+
+# Working directory for docs/record-demo.py
+/docs/.build/
+
+# Local Claude Code settings. Kept out of history explicitly rather than relying
+# on a machine-global ignore: this file names the MCP servers a workstation is
+# wired to, which is not information a public repo should carry.
+/.claude/settings.local.json

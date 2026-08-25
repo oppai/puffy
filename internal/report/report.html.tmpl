@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="{{.Theme}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+/* Palette roles. Light and dark are both selected sets, not a filter flip:
+   each is stepped for its own surface and was checked with the palette
+   validator against that surface. */
+.viz-root {
+  color-scheme: light;
+  --surface-1: #fcfcfb;
+  --page: #f9f9f7;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --series-1: #2a78d6;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --success-text: #006300;
+  /* Sequential ramps, 100 -> 700. Blue is the documented ramp; orange is the
+     second sequential context, built on the same lightness steps at orange's
+     hue. Lightest step means "near zero" and is meant to recede. */
+  --lat-ramp: #cde2fb, #b7d3f6, #9ec5f4, #86b6ef, #6da7ec, #5598e7, #3987e5, #2a78d6, #256abf, #1c5cab, #184f95, #104281, #0d366b;
+  --loss-ramp: #fbd7ca, #f5c3b2, #f2af97, #ec9b7e, #e78663, #e07249, #da5821, #ca4804, #b43f02, #a13400, #8c2c00, #782200, #641b00;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+    --success-text: #0ca30c;
+    /* The ramps run dark -> light on a dark surface. A sequential scale must
+       let "near zero" recede into the surface; on #1a1a19 that is the dark end,
+       so the same steps are traversed in the opposite direction. */
+    --lat-ramp: #0d366b, #104281, #184f95, #1c5cab, #256abf, #2a78d6, #3987e5, #5598e7, #6da7ec, #86b6ef, #9ec5f4, #b7d3f6, #cde2fb;
+    --loss-ramp: #641b00, #782200, #8c2c00, #a13400, #b43f02, #ca4804, #da5821, #e07249, #e78663, #ec9b7e, #f2af97, #f5c3b2, #fbd7ca;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-1: #1a1a19;
+  --page: #0d0d0d;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --series-1: #3987e5;
+  --success-text: #0ca30c;
+  --lat-ramp: #0d366b, #104281, #184f95, #1c5cab, #256abf, #2a78d6, #3987e5, #5598e7, #6da7ec, #86b6ef, #9ec5f4, #b7d3f6, #cde2fb;
+  --loss-ramp: #641b00, #782200, #8c2c00, #a13400, #b43f02, #ca4804, #da5821, #e07249, #e78663, #ec9b7e, #f2af97, #f5c3b2, #fbd7ca;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+/* The page plane is set on html with literal values. It sits outside .viz-root,
+   where the palette custom properties are declared, and custom properties only
+   inherit downwards - a var() on an ancestor resolves to nothing. */
+html { background: #f9f9f7; }
+@media (prefers-color-scheme: dark) {
+  html:where(:not([data-theme="light"])) { background: #0d0d0d; }
+}
+html[data-theme="dark"] { background: #0d0d0d; }
+.viz-root {
+  max-width: 1180px; margin: 0 auto; padding: 32px 24px 64px;
+  color: var(--text-primary);
+}
+
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 14px; font-weight: 600; margin: 0; }
+.sub { color: var(--text-secondary); font-size: 13px; margin: 0; }
+.muted { color: var(--text-muted); }
+
+/* One filter row above everything it scopes. */
+.filters {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin: 24px 0; padding: 10px 12px;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+}
+.filters .label { color: var(--text-muted); font-size: 12px; margin-right: 2px; }
+.filters .spacer { flex: 1 1 auto; }
+button {
+  font: inherit; font-size: 12px; color: var(--text-secondary);
+  background: transparent; border: 1px solid var(--border);
+  border-radius: 999px; padding: 4px 11px; cursor: pointer;
+}
+button:hover { background: color-mix(in oklab, var(--text-primary) 6%, transparent); }
+button[aria-pressed="true"] {
+  color: var(--text-primary); border-color: var(--text-muted);
+  background: color-mix(in oklab, var(--text-primary) 9%, transparent);
+  font-weight: 600;
+}
+
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 10px; padding: 18px 20px; margin-bottom: 20px;
+}
+.card-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 2px; }
+.card-note { color: var(--text-muted); font-size: 12px; margin: 0 0 14px; }
+
+/* Hero + stat tiles. Exactly one hero figure in the view. */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.tile .k { color: var(--text-muted); font-size: 12px; }
+.tile .v { font-size: 24px; font-weight: 600; margin-top: 2px; }
+.tile.hero .v { font-size: 48px; line-height: 1.05; letter-spacing: -0.02em; }
+.tile .u { font-size: 14px; font-weight: 500; color: var(--text-secondary); }
+.tile .d { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+
+/* Insights. A status colour never carries meaning alone: each row has a glyph
+   and a word. */
+.insights { list-style: none; margin: 0; padding: 0; }
+.insights li { display: flex; gap: 10px; padding: 7px 0; border-top: 1px solid var(--grid); font-size: 13px; }
+.insights li:first-child { border-top: 0; }
+.insights .mark { flex: 0 0 auto; font-weight: 700; width: 1.1em; text-align: center; }
+.insights .kind { flex: 0 0 auto; width: 108px; color: var(--text-secondary); font-weight: 600; font-size: 12px; text-transform: lowercase; }
+.insights .body { color: var(--text-secondary); }
+.k-loss_onset .mark { color: var(--critical); }
+.k-stall .mark { color: var(--serious); }
+.k-loss_window .mark { color: var(--warning); }
+.k-clean .mark { color: var(--good); }
+.k-icmp_limited .mark, .k-path_change .mark, .k-silent .mark { color: var(--text-muted); }
+
+/* Charts */
+svg { display: block; overflow: visible; }
+svg text { fill: var(--text-muted); font-size: 11px; }
+svg .tick-line { stroke: var(--grid); stroke-width: 1; }
+svg .axis-line { stroke: var(--axis); stroke-width: 1; }
+svg .series { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg .series-wash { fill: var(--series-1); opacity: 0.10; stroke: none; }
+svg .end-dot { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
+svg .end-label { fill: var(--text-secondary); font-weight: 600; }
+svg .loss-tick { fill: var(--critical); }
+svg .crosshair { stroke: var(--text-muted); stroke-width: 1; }
+svg .hit { fill: transparent; }
+
+/* Legends */
+.legend { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text-muted); }
+.legend .bar { display: flex; height: 10px; border-radius: 2px; overflow: hidden; width: 132px; }
+.legend .bar i { flex: 1 1 auto; }
+
+/* Small multiples */
+.multiples { display: grid; grid-template-columns: repeat(auto-fill, minmax(178px, 1fr)); gap: 4px 16px; }
+.mult { padding: 6px 0; }
+.mult .cap { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--text-muted); }
+.mult .cap b { color: var(--text-secondary); font-weight: 600; font-variant-numeric: tabular-nums; }
+.mult .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Tables: the WCAG-clean twin of every chart. */
+table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { color: var(--text-muted); font-weight: 600; }
+th:nth-child(2), td:nth-child(2) { text-align: left; width: 40%; white-space: normal; word-break: break-all; }
+tbody tr:hover { background: color-mix(in oklab, var(--text-primary) 4%, transparent); }
+details { margin-top: 12px; }
+summary { cursor: pointer; color: var(--text-secondary); font-size: 12px; }
+.scroll { overflow-x: auto; }
+
+#tooltip {
+  position: fixed; z-index: 20; pointer-events: none; opacity: 0;
+  transition: opacity .08s linear;
+  background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 7px 10px; font-size: 12px; line-height: 1.45;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .18);
+  max-width: 260px;
+}
+#tooltip b { font-weight: 600; }
+#tooltip .r { color: var(--text-secondary); }
+
+footer { color: var(--text-muted); font-size: 11px; margin-top: 28px; }
+footer code { font-size: 11px; }
+
+@media print {
+  body { background: #fff; }
+  .filters { display: none; }
+  .card { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+<div class="viz-root" id="root">
+  <h1 id="title">puffy report</h1>
+  <p class="sub" id="subtitle"></p>
+
+  <div class="filters" role="group" aria-label="Report filters">
+    <span class="label">Time range</span>
+    <span id="ranges"></span>
+    <span class="spacer"></span>
+    <button id="btn-texture" aria-pressed="false" title="Add an ordered diagonal texture to the heatmaps, for colour-vision, greyscale print and forced-colours">Patterns</button>
+    <button id="btn-theme" aria-pressed="false">Dark</button>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section class="card" id="card-insights">
+    <div class="card-head"><h2>What the measurement shows</h2></div>
+    <p class="card-note">Derived from the same samples the charts plot.</p>
+    <ul class="insights" id="insights"></ul>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2 id="rtt-title">Round-trip time to the destination</h2></div>
+    <p class="card-note" id="rtt-note"></p>
+    <div id="chart-rtt"></div>
+  </section>
+
+  <section class="card" id="card-loss">
+    <div class="card-head">
+      <h2>Packet loss by hop over time</h2>
+      <span class="spacer" style="flex:1"></span>
+      <span class="legend" id="legend-loss"></span>
+    </div>
+    <p class="card-note">Each row is one hop, each column a slice of time. Darker means a larger share of probes lost in that slice — this is where loss concentrates and when.</p>
+    <div id="chart-loss"></div>
+  </section>
+
+  <section class="card" id="card-stall">
+    <div class="card-head">
+      <h2>Latency stalls by hop over time</h2>
+      <span class="spacer" style="flex:1"></span>
+      <span class="legend" id="legend-stall"></span>
+    </div>
+    <p class="card-note">Round-trip time measured against each hop's own uncongested baseline, so a hop that is queueing stands out even where another hop is slower in absolute terms.</p>
+    <div id="chart-stall"></div>
+  </section>
+
+  <section class="card" id="card-multiples">
+    <div class="card-head"><h2>Per-hop round-trip time</h2></div>
+    <p class="card-note">One panel per hop on a shared vertical scale, so the panels are comparable. Red ticks mark lost probes.</p>
+    <div class="multiples" id="multiples"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>Hop statistics</h2></div>
+    <p class="card-note">The table view of every chart above. All times in milliseconds.</p>
+    <div class="scroll"><table id="table-hops"></table></div>
+    <details>
+      <summary>Raw samples</summary>
+      <div class="scroll" id="table-samples"></div>
+    </details>
+  </section>
+
+  <footer>
+    Generated by <b>puffy</b> <span id="gen-version"></span> ·
+    <span id="gen-when"></span> ·
+    self-contained: the measurement data is embedded in this file.
+  </footer>
+</div>
+
+<div id="tooltip" role="status" aria-live="polite"></div>
+
+<script type="application/json" id="puffy-data">{{.JSON}}</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("puffy-data").textContent);
+const SVGNS = "http://www.w3.org/2000/svg";
+
+/* ---------- palette access -------------------------------------------- */
+
+const cssVar = (n) => getComputedStyle(document.getElementById("root")).getPropertyValue(n).trim();
+function ramp(name) {
+  return cssVar(name).split(",").map(s => s.trim()).filter(Boolean);
+}
+/* Continuous sequential scale: one hue, light to dark. The ramp steps are dense
+   enough that interpolating between neighbours stays on the hue. */
+function rampColor(steps, t) {
+  if (!(t > 0)) return null;
+  t = Math.min(1, t);
+  const x = t * (steps.length - 1), i = Math.floor(x), f = x - i;
+  if (i >= steps.length - 1) return steps[steps.length - 1];
+  return mix(steps[i], steps[i + 1], f);
+}
+function mix(a, b, f) {
+  const pa = hex(a), pb = hex(b);
+  return "#" + pa.map((v, i) => Math.round(v + (pb[i] - v) * f).toString(16).padStart(2, "0")).join("");
+}
+const hex = (h) => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+
+/* ---------- formatting ------------------------------------------------ */
+
+const fmtMs = (v) => v == null ? "\u2014" : v < 1 ? v.toFixed(2) : v < 10 ? v.toFixed(1) : v < 1000 ? v.toFixed(0) : (v / 1000).toFixed(2) + "s";
+/* Table columns keep a fixed decimal count: a right-aligned column mixing
+   "2.1" and "25" reads as though the two were measured differently. */
+const fmtCol = (v) => v == null ? "\u2014" : v >= 1000 ? v.toFixed(0) : v.toFixed(1);
+const fmtPct = (v) => (v === 0 ? "0" : v < 1 ? v.toFixed(2) : v.toFixed(1)) + "%";
+function fmtOffset(ms) {
+  const sec = ms / 1000;
+  if (Math.abs(sec) < 60) return (sec < 0 ? "-" : "+") + Math.abs(sec).toFixed(1) + "s";
+  const s = Math.round(Math.abs(sec));
+  return (sec < 0 ? "-" : "+") + Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+function fmtDur(ms) {
+  if (ms < 1000) return Math.round(ms) + "ms";
+  const s = Math.round(ms / 1000);
+  if (s < 10 && ms % 1000 > 50) return (ms / 1000).toFixed(1) + "s";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60 ? " " + (s % 60) + "s" : "");
+  return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+}
+const hopLabel = (h) => h.name || (h.addrs && h.addrs[0]) || "*";
+
+/* ---------- svg helpers ---------------------------------------------- */
+
+function el(tag, attrs, parent) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) if (attrs[k] != null) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+function svgRoot(host, w, h) {
+  host.textContent = "";
+  const s = el("svg", { width: "100%", viewBox: `0 0 ${w} ${h}`, "preserveAspectRatio": "none" }, host);
+  s.style.height = h + "px";
+  s.setAttribute("preserveAspectRatio", "xMinYMin meet");
+  return s;
+}
+function niceStep(raw) {
+  if (!(raw > 0)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw))), n = raw / mag;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+}
+function niceBounds(lo, hi, count) {
+  if (!(hi > lo)) { const pad = Math.max(hi * 0.1, 0.5); lo -= pad; hi += pad; }
+  const step = niceStep((hi - lo) / Math.max(1, count));
+  const a = Math.floor(lo / step) * step, b = Math.ceil(hi / step) * step;
+  const ticks = [];
+  for (let v = a; v <= b + step / 2; v += step) ticks.push(+v.toFixed(6));
+  return { lo: a, hi: b > a ? b : a + step, ticks };
+}
+
+/* ---------- tooltip -------------------------------------------------- */
+
+const TIP = document.getElementById("tooltip");
+function showTip(evt, html) {
+  TIP.innerHTML = html;
+  TIP.style.opacity = "1";
+  const pad = 14, r = TIP.getBoundingClientRect();
+  let x = evt.clientX + pad, y = evt.clientY + pad;
+  if (x + r.width > innerWidth - 8) x = evt.clientX - r.width - pad;
+  if (y + r.height > innerHeight - 8) y = evt.clientY - r.height - pad;
+  TIP.style.left = Math.max(8, x) + "px";
+  TIP.style.top = Math.max(8, y) + "px";
+}
+const hideTip = () => { TIP.style.opacity = "0"; };
+
+/* ---------- state ---------------------------------------------------- */
+
+const STATE = { fromMs: 0, toMs: Infinity, texture: false };
+
+/* Stall scale. Everything below STALL_FLOOR x baseline reads as "nothing":
+   ordinary jitter puts almost every bucket a little above its own p20, so
+   without a dead zone the panel fills in solid and hides the real hotspots. */
+const STALL_FLOOR = 1.25, STALL_TOP = 4;
+
+function visibleSamples(hop) {
+  return (hop.samples || []).filter(s => s.t >= STATE.fromMs && s.t <= STATE.toMs);
+}
+/* Baseline is the 20th percentile of a hop's replies: its latency when nothing
+   is queueing. Comparing against this is what separates "slow hop" from
+   "hop that is stalling right now". */
+function baseline(samples) {
+  const v = samples.filter(s => s.rtt != null).map(s => s.rtt).sort((a, b) => a - b);
+  if (!v.length) return 0;
+  return v[Math.max(0, Math.ceil(0.2 * v.length) - 1)];
+}
+function statsOf(samples) {
+  const rtt = samples.filter(s => s.rtt != null).map(s => s.rtt);
+  const sent = samples.length, recv = rtt.length, lost = sent - recv;
+  const sorted = [...rtt].sort((a, b) => a - b);
+  const pct = (p) => sorted.length ? sorted[Math.max(0, Math.ceil(p / 100 * sorted.length) - 1)] : null;
+  let jSum = 0, jN = 0, prev = null;
+  for (const s of samples) {
+    if (s.rtt == null) { prev = null; continue; }
+    if (prev != null) { jSum += Math.abs(s.rtt - prev); jN++; }
+    prev = s.rtt;
+  }
+  return {
+    sent, recv, lost,
+    lossPct: sent ? lost / sent * 100 : 0,
+    last: recv ? rtt[rtt.length - 1] : null,
+    best: recv ? sorted[0] : null,
+    avg: recv ? rtt.reduce((a, b) => a + b, 0) / recv : null,
+    worst: recv ? sorted[sorted.length - 1] : null,
+    p50: pct(50), p95: pct(95),
+    jitter: jN ? jSum / jN : null,
+  };
+}
+
+/* Fold a hop's samples into n time-aligned buckets. Every hop uses the same
+   bucket edges, so a heatmap column means the same instant on every row. */
+function buckets(hop, n, from, to) {
+  const out = Array.from({ length: n }, (_, i) => ({
+    i, from: from + (to - from) * i / n, to: from + (to - from) * (i + 1) / n,
+    sent: 0, lost: 0, sum: 0, max: 0,
+  }));
+  const span = to - from;
+  for (const s of visibleSamples(hop)) {
+    let k = span > 0 ? Math.floor((s.t - from) / span * n) : 0;
+    k = Math.min(n - 1, Math.max(0, k));
+    const b = out[k];
+    b.sent++;
+    if (s.rtt == null) { b.lost++; continue; }
+    b.sum += s.rtt;
+    b.max = Math.max(b.max, s.rtt);
+  }
+  for (const b of out) {
+    b.recv = b.sent - b.lost;
+    b.avg = b.recv ? b.sum / b.recv : null;
+    b.lossPct = b.sent ? b.lost / b.sent * 100 : 0;
+  }
+  return out;
+}
+
+function timeExtent() {
+  let lo = Infinity, hi = -Infinity;
+  for (const h of DATA.hops) for (const s of h.samples || []) { lo = Math.min(lo, s.t); hi = Math.max(hi, s.t); }
+  if (!isFinite(lo)) { lo = 0; hi = 1; }
+  return [lo, hi + (DATA.interval_ms || 1000)];
+}
+
+/* ---------- texture: the colour-free backup channel ------------------ */
+
+/* One hand-drawn-style diagonal fill at 45 degrees, ordered: denser hatching
+   means a larger value. Off by default; on for the toggle, print and
+   forced-colours, where hue cannot be relied on. */
+function defsPatterns(svg, steps) {
+  const defs = el("defs", {}, svg);
+  steps.forEach((color, i) => {
+    const gap = [7, 5, 3.4, 2.4][i] || 2.4;
+    const p = el("pattern", {
+      id: "hatch" + i, width: gap, height: gap,
+      patternTransform: "rotate(45)", patternUnits: "userSpaceOnUse",
+    }, defs);
+    el("rect", { width: gap, height: gap, fill: color, opacity: 0.35 }, p);
+    el("line", { x1: 0, y1: 0, x2: 0, y2: gap, stroke: color, "stroke-width": 1.5 }, p);
+  });
+  return defs;
+}
+function cellFill(color, frac, steps) {
+  if (!STATE.texture) return color;
+  const i = frac <= 0.1 ? 0 : frac <= 0.35 ? 1 : frac <= 0.7 ? 2 : 3;
+  return `url(#hatch${i})`;
+}
+
+/* ---------- line chart ----------------------------------------------- */
+
+function lineChart(host, hop, from, to) {
+  const W = Math.max(520, host.clientWidth || 860);
+  const PLOT_H = 190, LOSS_H = 16, PAD_L = 52, PAD_R = 58, PAD_T = 12, PAD_B = 40;
+  const H = PAD_T + PLOT_H + 10 + LOSS_H + PAD_B;
+  const svg = svgRoot(host, W, H);
+  const samples = visibleSamples(hop);
+  const rtt = samples.filter(s => s.rtt != null);
+
+  if (!rtt.length) {
+    el("text", { x: PAD_L, y: PAD_T + 24 }, svg).textContent = "No replies in this time range.";
+    return;
+  }
+
+  const iw = W - PAD_L - PAD_R;
+  const lo = Math.min(...rtt.map(s => s.rtt)), hi = Math.max(...rtt.map(s => s.rtt));
+  const nb = niceBounds(lo, hi, 4);
+  const x = (t) => PAD_L + (to > from ? (t - from) / (to - from) * iw : iw / 2);
+  const y = (v) => PAD_T + PLOT_H - (v - nb.lo) / (nb.hi - nb.lo) * PLOT_H;
+
+  /* Gridlines and axis: solid hairlines, one step off the surface. */
+  for (const t of nb.ticks) {
+    el("line", { class: "tick-line", x1: PAD_L, x2: PAD_L + iw, y1: y(t), y2: y(t) }, svg);
+    el("text", { x: PAD_L - 8, y: y(t) + 4, "text-anchor": "end" }, svg).textContent = fmtMs(t);
+  }
+  el("line", { class: "axis-line", x1: PAD_L, x2: PAD_L + iw, y1: PAD_T + PLOT_H, y2: PAD_T + PLOT_H }, svg);
+
+  /* The line breaks at every lost probe rather than bridging it: an
+     interpolated segment across a gap is data the measurement does not have. */
+  const runs = [];
+  let cur = [];
+  for (const s of samples) {
+    if (s.rtt == null) { if (cur.length) runs.push(cur); cur = []; continue; }
+    cur.push(s);
+  }
+  if (cur.length) runs.push(cur);
+
+  for (const run of runs) {
+    if (run.length > 1) {
+      const area = run.map((s, i) => `${i ? "L" : "M"}${x(s.t).toFixed(1)},${y(s.rtt).toFixed(1)}`).join("")
+        + `L${x(run[run.length - 1].t).toFixed(1)},${(PAD_T + PLOT_H).toFixed(1)}`
+        + `L${x(run[0].t).toFixed(1)},${(PAD_T + PLOT_H).toFixed(1)}Z`;
+      el("path", { class: "series-wash", d: area }, svg);
+    }
+    const d = run.map((s, i) => `${i ? "L" : "M"}${x(s.t).toFixed(1)},${y(s.rtt).toFixed(1)}`).join("");
+    if (run.length === 1) el("circle", { class: "end-dot", cx: x(run[0].t), cy: y(run[0].rtt), r: 2.5 }, svg);
+    else el("path", { class: "series", d }, svg);
+  }
+
+  /* One direct label, on the last value. Not a number on every point. */
+  const lastS = rtt[rtt.length - 1];
+  el("circle", { class: "end-dot", cx: x(lastS.t), cy: y(lastS.rtt), r: 4 }, svg);
+  el("text", { class: "end-label", x: x(lastS.t) + 9, y: y(lastS.rtt) + 4 }, svg)
+    .textContent = fmtMs(lastS.rtt) + " ms";
+
+  /* Loss strip: loss gets its own row because a gap in a line and a flat
+     segment look alike. */
+  const lossY = PAD_T + PLOT_H + 10;
+  el("text", { x: PAD_L - 8, y: lossY + 12, "text-anchor": "end" }, svg).textContent = "loss";
+  el("line", { class: "tick-line", x1: PAD_L, x2: PAD_L + iw, y1: lossY + LOSS_H, y2: lossY + LOSS_H }, svg);
+  const lostN = samples.filter(s => s.rtt == null).length;
+  for (const s of samples) {
+    if (s.rtt != null) continue;
+    el("rect", { class: "loss-tick", x: x(s.t) - 1.5, y: lossY, width: 3, height: LOSS_H, rx: 1.5 }, svg);
+  }
+  if (!lostN) {
+    el("text", { x: PAD_L + 4, y: lossY + 12, fill: "var(--success-text)" }, svg).textContent = "none";
+  }
+
+  /* x axis labels */
+  const xt = [from, (from + to) / 2, to];
+  for (let i = 0; i < xt.length; i++) {
+    el("text", {
+      x: x(xt[i]), y: H - PAD_B + 30,
+      "text-anchor": i === 0 ? "start" : i === xt.length - 1 ? "end" : "middle",
+    }, svg).textContent = fmtOffset(xt[i]);
+  }
+  el("text", { x: PAD_L, y: H - PAD_B + 46, class: "muted" }, svg)
+    .textContent = "time since start of run";
+
+  /* Crosshair + nearest-point tooltip across the whole plot, so the hit target
+     is the full column rather than the 8px dot. */
+  const cross = el("line", { class: "crosshair", y1: PAD_T, y2: PAD_T + PLOT_H, opacity: 0 }, svg);
+  const dot = el("circle", { class: "end-dot", r: 4, opacity: 0 }, svg);
+  const hit = el("rect", { class: "hit", x: PAD_L, y: PAD_T, width: iw, height: PLOT_H + 10 + LOSS_H }, svg);
+  hit.addEventListener("mousemove", (ev) => {
+    const bb = svg.getBoundingClientRect();
+    const px = (ev.clientX - bb.left) / bb.width * W;
+    const t = from + (px - PAD_L) / iw * (to - from);
+    let near = null, bestD = Infinity;
+    for (const s of samples) { const d = Math.abs(s.t - t); if (d < bestD) { bestD = d; near = s; } }
+    if (!near) return;
+    cross.setAttribute("x1", x(near.t)); cross.setAttribute("x2", x(near.t)); cross.setAttribute("opacity", 1);
+    if (near.rtt != null) {
+      dot.setAttribute("cx", x(near.t)); dot.setAttribute("cy", y(near.rtt)); dot.setAttribute("opacity", 1);
+    } else dot.setAttribute("opacity", 0);
+    showTip(ev, `<b>${fmtOffset(near.t)}</b><br>` + (near.rtt == null
+      ? `<span style="color:var(--critical)">probe lost</span>`
+      : `<span class="r">rtt</span> <b>${fmtMs(near.rtt)} ms</b>`) +
+      (near.ip ? `<br><span class="r">from</span> ${near.ip}` : ""));
+  });
+  hit.addEventListener("mouseleave", () => { hideTip(); cross.setAttribute("opacity", 0); dot.setAttribute("opacity", 0); });
+}
+
+/* ---------- heatmap -------------------------------------------------- */
+
+function heatmap(host, kind, from, to) {
+  const hops = DATA.hops;
+  const W = Math.max(520, host.clientWidth || 860);
+  const PAD_L = 190, PAD_R = 12, PAD_T = 6, PAD_B = 34;
+  const ROW = 20, GAP = 2;
+  const H = PAD_T + hops.length * ROW + PAD_B;
+  const svg = svgRoot(host, W, H);
+
+  const iw = W - PAD_L - PAD_R;
+  /* Cells are at least 8px wide with a 2px surface gap between them, so the
+     bucket count follows the available width rather than the sample count. */
+  const n = Math.max(6, Math.min(160, Math.floor(iw / 10)));
+  const cw = iw / n;
+
+  const steps = ramp(kind === "loss" ? "--loss-ramp" : "--lat-ramp");
+  defsPatterns(svg, [steps[3], steps[6], steps[9], steps[12]]); // ordered along the active ramp
+
+  hops.forEach((hop, r) => {
+    const yTop = PAD_T + r * ROW;
+    const base = kind === "stall" ? baseline(visibleSamples(hop)) : 0;
+
+    el("text", { x: 4, y: yTop + ROW / 2 + 4 }, svg).textContent = String(hop.ttl);
+    const nameT = el("text", { x: 24, y: yTop + ROW / 2 + 4, fill: "var(--text-secondary)" }, svg);
+    nameT.textContent = trimTo(hopLabel(hop), 24);
+
+    for (const b of buckets(hop, n, from, to)) {
+      const x = PAD_L + b.i * cw;
+      if (!b.sent) continue;
+      let frac = 0, detail = "";
+      if (kind === "loss") {
+        frac = b.lossPct / 100;
+        detail = `<span class="r">loss</span> <b>${fmtPct(b.lossPct)}</b> (${b.lost}/${b.sent})`;
+      } else {
+        frac = base > 0 ? (b.max / base - STALL_FLOOR) / (STALL_TOP - STALL_FLOOR) : 0;
+        detail = `<span class="r">worst rtt</span> <b>${fmtMs(b.max)} ms</b><br>` +
+          `<span class="r">baseline</span> ${fmtMs(base)} ms` +
+          (base > 0 && b.max > 0 ? ` <b>(${(b.max / base).toFixed(1)}×)</b>` : "");
+      }
+      const color = rampColor(steps, frac);
+      const rect = el("rect", {
+        x: x + GAP / 2, y: yTop + GAP / 2, width: Math.max(1, cw - GAP), height: ROW - GAP, rx: 2,
+        fill: color ? cellFill(color, frac, steps) : "var(--axis)",
+        opacity: color ? 1 : 0.28,
+      }, svg);
+      rect.addEventListener("mouseenter", (ev) => showTip(ev,
+        `<b>ttl ${hop.ttl}</b> ${hopLabel(hop)}<br>` +
+        `<span class="r">${fmtOffset(b.from)} – ${fmtOffset(b.to)}</span><br>${detail}`));
+      rect.addEventListener("mousemove", (ev) => showTip(ev, TIP.innerHTML));
+      rect.addEventListener("mouseleave", hideTip);
+    }
+  });
+
+  const yb = PAD_T + hops.length * ROW;
+  el("line", { class: "axis-line", x1: PAD_L, x2: PAD_L + iw, y1: yb, y2: yb }, svg);
+  [[from, "start"], [(from + to) / 2, "middle"], [to, "end"]].forEach(([t, anchor], i) => {
+    el("text", { x: PAD_L + (i === 0 ? 0 : i === 1 ? iw / 2 : iw), y: yb + 16, "text-anchor": anchor }, svg)
+      .textContent = fmtOffset(t);
+  });
+  el("text", { x: 4, y: yb + 16 }, svg).textContent = "ttl / hop";
+  el("text", { x: PAD_L, y: yb + 30, class: "muted" }, svg)
+    .textContent = `${fmtDur(to - from)} of history in ${n} columns · a blank cell means no probe fell in that slice`;
+}
+
+function trimTo(s, n) { return s.length <= n ? s : s.slice(0, n - 1) + "…"; }
+
+function legend(host, kind, loLabel, hiLabel) {
+  const steps = ramp(kind === "loss" ? "--loss-ramp" : "--lat-ramp");
+  host.textContent = "";
+  const lo = document.createElement("span"); lo.textContent = loLabel;
+  const bar = document.createElement("span"); bar.className = "bar";
+  for (let i = 0; i < 24; i++) {
+    const seg = document.createElement("i");
+    seg.style.background = rampColor(steps, (i + 0.5) / 24);
+    bar.appendChild(seg);
+  }
+  const hi = document.createElement("span"); hi.textContent = hiLabel;
+  host.append(lo, bar, hi);
+}
+
+/* ---------- small multiples ------------------------------------------ */
+
+function multiples(host, from, to) {
+  host.textContent = "";
+  /* One shared vertical scale across every panel, so the panels compare. */
+  let hiAll = 0;
+  for (const h of DATA.hops) for (const s of visibleSamples(h)) if (s.rtt != null) hiAll = Math.max(hiAll, s.rtt);
+  const nb = niceBounds(0, hiAll || 1, 4);
+
+  for (const hop of DATA.hops) {
+    const samples = visibleSamples(hop);
+    const st = statsOf(samples);
+    const wrap = document.createElement("div");
+    wrap.className = "mult";
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    cap.innerHTML = `<span class="name">${hop.ttl} · ${escapeHtml(hopLabel(hop))}</span>` +
+      `<b>${st.avg == null ? "—" : fmtMs(st.avg) + "ms"}</b>`;
+    wrap.appendChild(cap);
+    const box = document.createElement("div");
+    wrap.appendChild(box);
+    host.appendChild(wrap);
+
+    const W = 200, H = 40, P = 3;
+    const svg = svgRoot(box, W, H);
+    const x = (t) => P + (to > from ? (t - from) / (to - from) * (W - 2 * P) : (W - 2 * P) / 2);
+    const y = (v) => H - P - (v - nb.lo) / (nb.hi - nb.lo) * (H - 2 * P);
+    el("line", { class: "tick-line", x1: P, x2: W - P, y1: H - P, y2: H - P }, svg);
+
+    const runs = []; let cur = [];
+    for (const s of samples) { if (s.rtt == null) { if (cur.length) runs.push(cur); cur = []; } else cur.push(s); }
+    if (cur.length) runs.push(cur);
+    for (const run of runs) {
+      if (run.length < 2) { if (run.length) el("circle", { class: "end-dot", cx: x(run[0].t), cy: y(run[0].rtt), r: 1.8 }, svg); continue; }
+      const d = run.map((s, i) => `${i ? "L" : "M"}${x(s.t).toFixed(1)},${y(s.rtt).toFixed(1)}`).join("");
+      el("path", { class: "series-wash", d: d + `L${x(run[run.length - 1].t).toFixed(1)},${H - P}L${x(run[0].t).toFixed(1)},${H - P}Z` }, svg);
+      el("path", { class: "series", d, "stroke-width": 1.5 }, svg);
+    }
+    /* Loss rides a thin strip along the baseline. Full-height ticks turn a hop
+       that loses half its probes into a solid red block with no visible line. */
+    for (const s of samples) if (s.rtt == null) el("rect", { class: "loss-tick", x: x(s.t) - 1, y: H - P - 3, width: 2, height: 4, rx: 1 }, svg);
+
+    const hit = el("rect", { class: "hit", x: 0, y: 0, width: W, height: H }, svg);
+    hit.addEventListener("mousemove", (ev) => showTip(ev,
+      `<b>ttl ${hop.ttl}</b> ${escapeHtml(hopLabel(hop))}<br>` +
+      `<span class="r">loss</span> <b>${fmtPct(st.lossPct)}</b> · <span class="r">avg</span> <b>${fmtMs(st.avg)}ms</b><br>` +
+      `<span class="r">best / p95 / worst</span> ${fmtMs(st.best)} / ${fmtMs(st.p95)} / ${fmtMs(st.worst)} ms`));
+    hit.addEventListener("mouseleave", hideTip);
+  }
+  const note = document.createElement("div");
+  note.className = "muted";
+  note.style.cssText = "grid-column:1/-1;font-size:11px;margin-top:6px";
+  note.textContent = `shared scale 0–${fmtMs(nb.hi)} ms`;
+  host.appendChild(note);
+}
+
+const escapeHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+/* ---------- tables --------------------------------------------------- */
+
+function tables() {
+  const cols = [
+    ["ttl", h => h.ttl],
+    ["host", h => escapeHtml(hopLabel(h)) + (h.addrs && h.addrs.length > 1 ? ` <span class="muted">(+${h.addrs.length - 1} more)</span>` : "")],
+    ["sent", (h, s) => s.sent], ["recv", (h, s) => s.recv], ["lost", (h, s) => s.lost],
+    ["loss", (h, s) => fmtPct(s.lossPct)],
+    ["last", (h, s) => fmtCol(s.last)], ["best", (h, s) => fmtCol(s.best)],
+    ["avg", (h, s) => fmtCol(s.avg)], ["p95", (h, s) => fmtCol(s.p95)],
+    ["worst", (h, s) => fmtCol(s.worst)], ["jitter", (h, s) => fmtCol(s.jitter)],
+    ["baseline", (h) => fmtCol(baseline(visibleSamples(h)))],
+  ];
+  const t = document.getElementById("table-hops");
+  t.innerHTML = "<thead><tr>" + cols.map(c => `<th>${c[0]}</th>`).join("") + "</tr></thead><tbody>" +
+    DATA.hops.map(h => {
+      const s = statsOf(visibleSamples(h));
+      return "<tr>" + cols.map(c => `<td>${c[1](h, s)}</td>`).join("") + "</tr>";
+    }).join("") + "</tbody>";
+
+  const host = document.getElementById("table-samples");
+  const rows = [];
+  for (const h of DATA.hops) for (const s of visibleSamples(h)) {
+    rows.push(`<tr><td>${h.ttl}</td><td>${escapeHtml(s.ip || "")}</td><td>${s.r}</td><td>${fmtOffset(s.t)}</td><td>${s.rtt == null ? "lost" : fmtCol(s.rtt)}</td></tr>`);
+  }
+  host.innerHTML = "<table><thead><tr><th>ttl</th><th>from</th><th>round</th><th>at</th><th>rtt ms</th></tr></thead><tbody>" +
+    rows.join("") + "</tbody></table>";
+}
+
+/* ---------- tiles & insights ----------------------------------------- */
+
+function tiles(from, to) {
+  const dest = DATA.hops.length ? DATA.hops[DATA.hops.length - 1] : null;
+  const ds = dest ? statsOf(visibleSamples(dest)) : null;
+
+  /* Which hop is actually responsible for loss. A hop whose loss does not
+     show up downstream was only slow to answer about itself, so blaming it here
+     would contradict the findings listed right below these tiles. The rule is
+     the same one the analysis uses: compare against the cleanest hop
+     downstream, not the worst. */
+  const perHop = DATA.hops.map(h => ({ h, s: statsOf(visibleSamples(h)) }));
+  let worst = null, excused = [];
+  perHop.forEach((cur, i) => {
+    if (cur.s.sent === 0 || cur.s.lossPct < 2) return;
+    const below = perHop.slice(i + 1).filter(d => d.s.sent > 0);
+    const cleanest = below.length ? Math.min(...below.map(d => d.s.lossPct)) : 0;
+    if (below.length && cleanest + 1 < cur.s.lossPct) { excused.push(cur.h.ttl); return; }
+    if (!worst || cur.s.lossPct > worst.s.lossPct) worst = cur;
+  });
+
+  const host = document.getElementById("tiles");
+  host.textContent = "";
+  const add = (k, v, u, d, hero) => {
+    const el2 = document.createElement("div");
+    el2.className = "tile" + (hero ? " hero" : "");
+    el2.innerHTML = `<div class="k">${k}</div><div class="v">${v}<span class="u">${u || ""}</span></div>` +
+      (d ? `<div class="d">${d}</div>` : "");
+    host.appendChild(el2);
+  };
+
+  /* The hero is end-to-end loss: it is the number the run was started to find. */
+  add("End-to-end packet loss", ds ? fmtPct(ds.lossPct).replace("%", "") : "—", "%",
+    ds ? `${ds.lost} of ${ds.sent} probes to ${escapeHtml(hopLabel(dest))}` : "", true);
+  add("Round-trip time", ds && ds.avg != null ? fmtMs(ds.avg) : "—", " ms avg",
+    ds && ds.p95 != null ? `p95 ${fmtMs(ds.p95)} · best ${fmtMs(ds.best)} · worst ${fmtMs(ds.worst)} ms` : "");
+  add("Jitter", ds && ds.jitter != null ? fmtMs(ds.jitter) : "—", " ms",
+    "mean change between consecutive replies");
+  add("Worst hop for loss", worst ? `ttl ${worst.h.ttl}` : "none", "",
+    worst
+      ? `${fmtPct(worst.s.lossPct)} at ${escapeHtml(hopLabel(worst.h))}`
+      : excused.length
+        ? `ttl ${excused.join(", ")} lose replies about themselves, but forward fine`
+        : "no probe lost at any hop");
+  add("Window", fmtDur(to - from), "", `${DATA.hops.length} hops · every ${fmtDur(DATA.interval_ms)}`);
+}
+
+const INSIGHT_MARK = {
+  loss_onset: ["✖", "loss origin"], stall: ["▲", "stall"],
+  loss_window: ["◆", "loss window"], icmp_limited: ["ℹ", "icmp limited"],
+  path_change: ["⇄", "path change"], silent: ["◌", "silent hop"], clean: ["✔", "clean"],
+};
+function insights() {
+  const host = document.getElementById("insights");
+  const list = DATA.insights || [];
+  host.textContent = "";
+  if (!list.length) { document.getElementById("card-insights").style.display = "none"; return; }
+  for (const ins of list) {
+    const [mark, name] = INSIGHT_MARK[ins.kind] || ["·", ins.kind];
+    const li = document.createElement("li");
+    li.className = "k-" + ins.kind;
+    li.innerHTML = `<span class="mark">${mark}</span><span class="kind">${name}</span>` +
+      `<span class="body">${ins.ttl ? `<b>ttl ${ins.ttl}</b>${ins.addr ? " " + escapeHtml(ins.addr) : ""} — ` : ""}${escapeHtml(ins.detail)}</span>`;
+    host.appendChild(li);
+  }
+}
+
+/* ---------- filters & render ----------------------------------------- */
+
+function buildRanges(lo, hi) {
+  const total = hi - lo;
+  const opts = [{ label: "All", ms: total }];
+  for (const m of [30, 10, 5, 1]) {
+    if (total > m * 60000 * 1.2) opts.push({ label: m + "m", ms: m * 60000 });
+  }
+  const host = document.getElementById("ranges");
+  host.textContent = "";
+  opts.forEach((o, i) => {
+    const b = document.createElement("button");
+    b.textContent = o.label;
+    b.setAttribute("aria-pressed", i === 0 ? "true" : "false");
+    b.addEventListener("click", () => {
+      [...host.children].forEach(c => c.setAttribute("aria-pressed", "false"));
+      b.setAttribute("aria-pressed", "true");
+      STATE.fromMs = hi - o.ms; STATE.toMs = hi;
+      render();
+    });
+    host.appendChild(b);
+  });
+}
+
+function render() {
+  const [lo, hi] = timeExtent();
+  const from = Math.max(lo, STATE.fromMs), to = Math.min(hi, STATE.toMs === Infinity ? hi : STATE.toMs);
+
+  tiles(from, to);
+  insights();
+
+  const dest = DATA.hops.length ? DATA.hops[DATA.hops.length - 1] : null;
+  document.getElementById("rtt-title").textContent =
+    DATA.mode === "ping" ? `Round-trip time to ${DATA.target_name || DATA.target_ip}`
+      : `Round-trip time to the destination (ttl ${dest ? dest.ttl : "?"}, ${hopLabel(dest || {})})`;
+  document.getElementById("rtt-note").textContent =
+    "Lost probes break the line instead of being interpolated across, and are marked on the loss row below.";
+  if (dest) lineChart(document.getElementById("chart-rtt"), dest, from, to);
+
+  heatmap(document.getElementById("chart-loss"), "loss", from, to);
+  heatmap(document.getElementById("chart-stall"), "stall", from, to);
+  legend(document.getElementById("legend-loss"), "loss", "0%", "100% lost");
+  legend(document.getElementById("legend-stall"), "stall", "1.25×", "4×+ baseline");
+
+  const single = DATA.hops.length <= 1;
+  document.getElementById("card-loss").style.display = single ? "none" : "";
+  document.getElementById("card-stall").style.display = single ? "none" : "";
+  document.getElementById("card-multiples").style.display = single ? "none" : "";
+  if (!single) multiples(document.getElementById("multiples"), from, to);
+
+  tables();
+}
+
+function init() {
+  const [lo, hi] = timeExtent();
+  STATE.fromMs = lo; STATE.toMs = hi;
+
+  document.getElementById("title").textContent =
+    `puffy ${DATA.mode} — ${DATA.target_name || DATA.target || DATA.target_ip}`;
+  const started = new Date(DATA.started_at);
+  document.getElementById("subtitle").textContent =
+    `${DATA.target_ip} · ${DATA.rounds} rounds every ${fmtDur(DATA.interval_ms)} · ` +
+    `${fmtDur(new Date(DATA.ended_at) - started)} from ${started.toLocaleString()}`;
+  document.getElementById("gen-version").textContent = DATA.version || "";
+  document.getElementById("gen-when").textContent = new Date(DATA.ended_at).toLocaleString();
+  document.title = `puffy ${DATA.mode} ${DATA.target_ip}`;
+
+  buildRanges(lo, hi);
+
+  const themeBtn = document.getElementById("btn-theme");
+  const applyTheme = () => {
+    const dark = document.documentElement.getAttribute("data-theme") === "dark";
+    themeBtn.textContent = dark ? "Light" : "Dark";
+    themeBtn.setAttribute("aria-pressed", dark ? "true" : "false");
+  };
+  themeBtn.addEventListener("click", () => {
+    const dark = document.documentElement.getAttribute("data-theme") === "dark";
+    document.documentElement.setAttribute("data-theme", dark ? "light" : "dark");
+    applyTheme();
+    render();
+  });
+  applyTheme();
+
+  const texBtn = document.getElementById("btn-texture");
+  const applyTexture = (on) => {
+    STATE.texture = on;
+    texBtn.setAttribute("aria-pressed", on ? "true" : "false");
+    render();
+  };
+  texBtn.addEventListener("click", () => applyTexture(!STATE.texture));
+  /* Where hue cannot be trusted, turn the texture on without being asked. */
+  const forced = matchMedia("(forced-colors: active)");
+  if (forced.matches) applyTexture(true);
+  forced.addEventListener?.("change", (e) => applyTexture(e.matches));
+  matchMedia("print").addEventListener?.("change", (e) => { if (e.matches) applyTexture(true); });
+
+  render();
+  let t;
+  addEventListener("resize", () => { clearTimeout(t); t = setTimeout(render, 150); });
+}
+
+init();
+</script>
+</body>
+</html>
