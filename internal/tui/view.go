@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/oppai/puffy/internal/model"
 )
@@ -10,10 +11,81 @@ import (
 // View renders a session snapshot to terminal lines. One type serves both
 // modes: a ping is a trace with a single hop, and the only real difference is
 // that a single hop has room for a full line chart.
+//
+// Every frame is built from two things that must not be confused: the window,
+// which is the stretch of time the graphs draw, and the session, which is
+// everything measured since the run started. A number is always labelled with
+// which of the two it describes.
 type View struct {
 	Screen *Screen
-	// Window is how many trailing rounds to show, or 0 for "as many as fit".
+	// Window is how many trailing rounds to graph, or 0 for the default window.
 	Window int
+	// Interval is the probe interval, used to size the default window in time
+	// rather than in rounds. Zero falls back to the session's own interval.
+	Interval time.Duration
+}
+
+// liveWindowMS is how much time the live graphs show by default. Fixing the
+// window in time - rather than letting it grow to "the whole run so far" - is
+// what keeps the picture moving after six hours: a column is worth the same
+// number of rounds at minute one and at hour six, so the graph scrolls instead
+// of folding itself flat.
+const liveWindowMS = 60000
+
+// maxLiveFold caps how many rounds the default window folds into one column.
+// Past a couple of hundred a column is a blur - worst-wins folding stops saying
+// anything new - while the frame keeps paying for every probe in it. Only an
+// interval under about 10ms reaches this; an explicit --window is obeyed as
+// given, because then the span is what the reader asked for.
+const maxLiveFold = 200
+
+// WindowRounds is how many trailing rounds the next frame will draw. The caller
+// snapshots exactly this much history, so one redraw costs the window rather
+// than the whole run - which is what keeps a long session's graph moving and its
+// Ctrl-C prompt.
+func (v View) WindowRounds(mode string) int {
+	cols, _ := v.Screen.Size()
+	if mode == "ping" {
+		return pingWindow(cols, v.Window)
+	}
+	return traceWindow(layoutFor(cols, statSets).sparkW, v.intervalMS(nil), v.Window)
+}
+
+// intervalMS prefers the interval the run was configured with, falling back to
+// whatever the session document says.
+func (v View) intervalMS(s *model.Session) float64 {
+	if v.Interval > 0 {
+		return float64(v.Interval) / float64(time.Millisecond)
+	}
+	if s != nil {
+		return s.IntervalMS
+	}
+	return 0
+}
+
+// traceWindow is the trace graph's default window in rounds: the last minute,
+// or a screenful of rounds when the interval is so slow that a minute would not
+// fill the width.
+func traceWindow(sparkW int, intervalMS float64, override int) int {
+	if override > 0 {
+		return override
+	}
+	n := sparkW
+	if intervalMS > 0 {
+		if k := int(liveWindowMS / intervalMS); k > n {
+			n = min(k, sparkW*maxLiveFold)
+		}
+	}
+	return max(n, 1)
+}
+
+// pingWindow is the ping chart's window: one dot column per probe, and braille
+// gives two dots per character.
+func pingWindow(cols, override int) int {
+	if override > 0 {
+		return override
+	}
+	return max((cols-10)*2, 8)
 }
 
 // Live renders the frame for an in-progress session.
@@ -44,8 +116,14 @@ func (v View) pingFrame(c Color, s *model.Session, cols, rows int) []string {
 		return []string{c.Dim("waiting for the first reply…")}
 	}
 
+	// One dot column per sample keeps the curve honest; braille gives two per
+	// character, so the window is twice the plot width.
+	samples := hop.Window(pingWindow(cols, v.Window))
+	win := model.StatsOf(samples)
+	spanMS := float64(len(samples)) * s.IntervalMS
+
 	out := []string{v.header(c, s, cols), ""}
-	out = append(out, v.pingStats(c, hop)...)
+	out = append(out, v.pingStats(c, win, hop.Stats, spanMS, s.Elapsed(), cols)...)
 	out = append(out, "")
 
 	// Everything not spent on the chart: header 1, blank 2, stats 2, blank 1,
@@ -58,16 +136,6 @@ func (v View) pingFrame(c Color, s *model.Session, cols, rows int) []string {
 		chartRows = 3
 	}
 
-	// One dot column per sample keeps the curve honest; braille gives two per
-	// character, so the window is twice the plot width.
-	plotW := cols - 10
-	window := v.Window
-	if window <= 0 {
-		window = plotW * 2
-	}
-	samples := hop.Window(window)
-	spanMS := float64(len(samples)) * s.IntervalMS
-
 	out = append(out, c.Dim("  rtt ms"))
 	chart := LineChart{Width: cols - 2, Height: chartRows}
 	for _, l := range chart.Render(c, samples, spanMS) {
@@ -75,12 +143,13 @@ func (v View) pingFrame(c Color, s *model.Session, cols, rows int) []string {
 	}
 
 	out = append(out, "")
-	// indent(2) + "loss  "(6) + strip + gap(2) + "100.0%"(6)
-	pct := fmt.Sprintf("%.1f%%", hop.Stats.LossPct)
+	// indent(2) + "loss  "(6) + strip + gap(2) + "100.0%"(6). The percentage is
+	// the window's, because the strip beside it is the window.
+	pct := fmt.Sprintf("%.1f%%", win.LossPct)
 	stripW := cols - 2 - 6 - 2 - len(pct)
 	if stripW > 4 {
 		out = append(out, "  "+c.Dim("loss  ")+LossStrip(c, samples, stripW)+
-			"  "+c.Paint(lossRole(hop.Stats.LossPct), pct))
+			"  "+c.Paint(lossRole(win.LossPct), pct))
 	}
 	out = append(out, "")
 	legend := "  " + c.Dim("· delivered  ") + c.Paint(RoleCritical, "×") + c.Dim(" lost")
@@ -91,17 +160,62 @@ func (v View) pingFrame(c Color, s *model.Session, cols, rows int) []string {
 	return fit(out, cols, rows)
 }
 
-func (v View) pingStats(c Color, hop *model.Hop) []string {
-	st := hop.Stats
-	left := fmt.Sprintf("%d sent · %d recv · %d lost", st.Sent, st.Recv, st.Lost)
-	loss := c.Paint(lossRole(st.LossPct), fmt.Sprintf("loss %.1f%%", st.LossPct))
+// pingStats prints the window on one line and the session on the next. Two rows
+// rather than one set of numbers, because "12ms average" means something
+// different over the last minute than over the last six hours, and the row that
+// answers "is it bad right now" is not the row that answers "has it been bad".
+func (v View) pingStats(c Color, win, sess model.Stats, winSpan, sessSpan float64, cols int) []string {
+	row := func(label string, st model.Stats, fields []string, dim bool) string {
+		head := "  " + c.Dim(fmt.Sprintf("%-14s", label))
+		loss := c.Paint(lossRole(st.LossPct), fmt.Sprintf("loss %5.1f%%", st.LossPct))
+		if st.Sent == 0 {
+			loss = c.Dim("loss      -")
+		}
+		// 2 indent + 14 label + 11 loss + 3 gap
+		tail := joinFit(fields, cols-30)
+		if dim {
+			tail = c.Dim(tail)
+		}
+		return head + loss + "   " + tail
+	}
 
-	row1 := fmt.Sprintf("  %-28s %s   last %sms   avg %sms",
-		left, loss, fmtMS(st.Last), fmtMS(st.Avg))
-	row2 := fmt.Sprintf("  %-28s %s", "",
-		c.Dim(fmt.Sprintf("best %sms   worst %sms   p95 %sms   jitter %sms",
-			fmtMS(st.Best), fmtMS(st.Worst), fmtMS(st.P95), fmtMS(st.Jitter))))
-	return []string{row1, row2}
+	winFields := []string{
+		fmt.Sprintf("%d/%d recv", win.Recv, win.Sent),
+		"last " + fmtMS(win.Last) + "ms",
+		"avg " + fmtMS(win.Avg) + "ms",
+		"best " + fmtMS(win.Best),
+		"worst " + fmtMS(win.Worst),
+		"jitter " + fmtMS(win.Jitter),
+	}
+	sessFields := []string{
+		fmt.Sprintf("%d/%d recv", sess.Recv, sess.Sent),
+		"avg " + fmtMS(sess.Avg) + "ms",
+		"p50 " + fmtMS(sess.P50),
+		"p95 " + fmtMS(sess.P95),
+		"best " + fmtMS(sess.Best),
+		"worst " + fmtMS(sess.Worst),
+	}
+	return []string{
+		row("window "+fmtSpan(winSpan), win, winFields, false),
+		row("session "+fmtSpan(sessSpan), sess, sessFields, true),
+	}
+}
+
+// joinFit joins as many fields as fit in w columns, so a narrow terminal sheds
+// the least important number instead of having a value cut in half.
+func joinFit(fields []string, w int) string {
+	var out string
+	for _, f := range fields {
+		next := f
+		if out != "" {
+			next = out + "   " + f
+		}
+		if len(next) > w {
+			break
+		}
+		out = next
+	}
+	return out
 }
 
 // --- trace ------------------------------------------------------------------
@@ -113,16 +227,36 @@ func (v View) traceFrame(c Color, s *model.Session, cols, rows int, summary bool
 
 	out := []string{v.header(c, s, cols), ""}
 
-	lay := layoutFor(cols)
-	plan := s.PlanCols(lay.sparkW, v.Window)
-	scaleMax := s.MaxRTT()
+	sets := statSets
+	if summary {
+		sets = summarySets
+	}
+	lay := layoutFor(cols, sets)
+	// The live view graphs a fixed window and scrolls; the summary is allowed to
+	// fold everything it still holds into the same width, because by then the
+	// whole run is the thing being reported.
+	window := 0
+	if !summary {
+		window = traceWindow(lay.sparkW, v.intervalMS(s), v.Window)
+	} else if v.Window > 0 {
+		window = v.Window
+	}
+	plan := s.PlanCols(lay.sparkW, window)
 	spanMS := float64(plan.LastRound-plan.FirstRound+1) * s.IntervalMS
 
-	head := fmt.Sprintf("%3s %-*s %6s", "ttl", lay.hostW, "host", "loss")
-	for _, sc := range lay.stats {
-		head += fmt.Sprintf(" %7s", sc.head)
+	cellsFor := make(map[int][]model.Cell, len(s.Hops))
+	winStats := make(map[int]model.Stats, len(s.Hops))
+	windowed := lay.hasScope(scopeWindow)
+	for _, h := range s.Hops {
+		cellsFor[h.TTL] = h.Cells(plan)
+		if windowed {
+			winStats[h.TTL] = model.StatsOf(h.Range(plan))
+		}
 	}
-	out = append(out, c.Dim(head+"  "+"rtt over time →"))
+	scaleMax := scaleOf(s, cellsFor)
+
+	out = append(out, lay.groupHeader(c, spanMS, s.Elapsed()))
+	out = append(out, c.Dim(lay.head()+"  "+"rtt over time →"))
 
 	// Reserve room for the panels below before deciding how many hops fit.
 	reserve := 6
@@ -136,17 +270,12 @@ func (v View) traceFrame(c Color, s *model.Session, cols, rows int, summary bool
 		}
 	}
 
-	cellsFor := make(map[int][]model.Cell, len(s.Hops))
-	for _, h := range s.Hops {
-		cellsFor[h.TTL] = h.Cells(plan)
-	}
-
 	for i, h := range s.Hops {
 		if i >= maxHops {
 			out = append(out, c.Dim(fmt.Sprintf("    … %d more hops (widen or lengthen the window)", len(s.Hops)-maxHops)))
 			break
 		}
-		out = append(out, v.hopRow(c, h, lay, cellsFor[h.TTL], scaleMax))
+		out = append(out, v.hopRow(c, h, lay, cellsFor[h.TTL], winStats[h.TTL], scaleMax))
 	}
 
 	// Whatever is left after the hop table is the panels' budget. Below four
@@ -164,33 +293,147 @@ func (v View) traceFrame(c Color, s *model.Session, cols, rows int, summary bool
 	return fit(out, cols, rows)
 }
 
-func (v View) hopRow(c Color, h *model.Hop, lay layout, cells []model.Cell, scaleMax float64) string {
-	st := h.Stats
+// scaleOf is the shared vertical scale for the sparklines: the worst RTT drawn
+// in this frame. Scaling to the whole session instead would flatten every row
+// the moment one spike landed, and that one spike would then keep the graph flat
+// for the rest of the run - a long session's series would slowly die out.
+func scaleOf(s *model.Session, cellsFor map[int][]model.Cell) float64 {
+	var m float64
+	for _, cells := range cellsFor {
+		for _, cell := range cells {
+			if cell.MaxRTT > m {
+				m = cell.MaxRTT
+			}
+		}
+	}
+	if m <= 0 {
+		return s.MaxRTT()
+	}
+	return m
+}
+
+func (v View) hopRow(c Color, h *model.Hop, lay layout, cells []model.Cell, win model.Stats, scaleMax float64) string {
 	name := h.Label()
 	if h.Final {
 		name = "● " + name // the destination
 	}
 	label := truncate(name, lay.hostW)
 
-	lossCell := c.Paint(lossRole(st.LossPct), fmt.Sprintf("%5.1f%%", st.LossPct))
-	if st.Sent == 0 {
-		lossCell = c.Dim("     -")
-	}
-
-	var nums string
-	for _, sc := range lay.stats {
-		if st.Recv == 0 {
-			nums += c.Dim(fmt.Sprintf(" %7s", "-"))
-			continue
+	stats := lay.block(func(col statCol) string {
+		st := win
+		if col.scope == scopeSession {
+			st = h.Stats
 		}
-		nums += fmt.Sprintf(" %7s", fmtCol(sc.val(st)))
-	}
+		switch {
+		case st.Sent == 0, !col.pct && st.Recv == 0:
+			return c.Dim(fmt.Sprintf("%*s", statW, "-"))
+		case col.pct:
+			return c.Paint(lossRole(st.LossPct), fmt.Sprintf("%*.1f%%", statW-1, st.LossPct))
+		default:
+			return fmt.Sprintf("%*s", statW, fmtCol(col.val(st)))
+		}
+	})
 
-	return fmt.Sprintf("%s %s %s%s  %s",
+	return fmt.Sprintf("%s %s%s  %s",
 		c.Dim(fmt.Sprintf("%3d", h.TTL)),
 		fmt.Sprintf("%-*s", lay.hostW, label),
-		lossCell, nums,
+		stats,
 		Sparkline(c, cells, scaleMax, h.Baseline()))
+}
+
+// --- table layout -----------------------------------------------------------
+
+// scope says which statistics a column reads. Keeping the two apart is the
+// point of the table: a session average over six hours cannot tell you the path
+// went bad thirty seconds ago, and a thirty-second average cannot tell you it
+// has been going bad all day.
+type scope int
+
+const (
+	scopeWindow scope = iota
+	scopeSession
+)
+
+// statW is the width of every statistic column. One width for all of them means
+// the group rules above the table line up with the columns they cover.
+const statW = 7
+
+type statCol struct {
+	head  string
+	scope scope
+	pct   bool // a loss percentage, coloured by severity
+	val   func(model.Stats) float64
+}
+
+func lossCol(sc scope) statCol {
+	return statCol{head: "loss", scope: sc, pct: true}
+}
+
+func msCol(head string, sc scope, val func(model.Stats) float64) statCol {
+	return statCol{head: head, scope: sc, val: val}
+}
+
+func statLast(s model.Stats) float64  { return s.Last }
+func statBest(s model.Stats) float64  { return s.Best }
+func statAvg(s model.Stats) float64   { return s.Avg }
+func statWorst(s model.Stats) float64 { return s.Worst }
+func statP95(s model.Stats) float64   { return s.P95 }
+
+// statSets are the candidate column sets, widest first. A narrow terminal drops
+// numbers rather than the time series - the series is the point of the tool, and
+// every number is in the JSON and the HTML table anyway - but it never drops the
+// window/session pairing until there is only one column left to keep: knowing
+// whether a figure is "now" or "all run" matters more than any of the figures.
+var statSets = [][]statCol{
+	{
+		lossCol(scopeWindow), msCol("last", scopeWindow, statLast),
+		msCol("avg", scopeWindow, statAvg), msCol("worst", scopeWindow, statWorst),
+		lossCol(scopeSession), msCol("avg", scopeSession, statAvg),
+		msCol("p95", scopeSession, statP95), msCol("worst", scopeSession, statWorst),
+	},
+	{
+		lossCol(scopeWindow), msCol("last", scopeWindow, statLast),
+		msCol("avg", scopeWindow, statAvg),
+		lossCol(scopeSession), msCol("avg", scopeSession, statAvg),
+		msCol("worst", scopeSession, statWorst),
+	},
+	{
+		lossCol(scopeWindow), msCol("last", scopeWindow, statLast),
+		msCol("avg", scopeWindow, statAvg),
+		lossCol(scopeSession), msCol("avg", scopeSession, statAvg),
+	},
+	{
+		lossCol(scopeWindow), msCol("avg", scopeWindow, statAvg),
+		lossCol(scopeSession), msCol("avg", scopeSession, statAvg),
+	},
+	{
+		lossCol(scopeWindow), msCol("avg", scopeWindow, statAvg),
+		lossCol(scopeSession),
+	},
+	{lossCol(scopeWindow), lossCol(scopeSession)},
+	{lossCol(scopeWindow)},
+}
+
+// summarySets are the column sets for the after-the-fact report. By then the
+// graph covers the whole run it still holds, so a window column beside the
+// session one would only say the same thing twice; the width goes to the time
+// series instead.
+var summarySets = [][]statCol{
+	{
+		lossCol(scopeSession), msCol("last", scopeSession, statLast),
+		msCol("avg", scopeSession, statAvg), msCol("best", scopeSession, statBest),
+		msCol("worst", scopeSession, statWorst),
+	},
+	{
+		lossCol(scopeSession), msCol("last", scopeSession, statLast),
+		msCol("avg", scopeSession, statAvg), msCol("worst", scopeSession, statWorst),
+	},
+	{
+		lossCol(scopeSession), msCol("avg", scopeSession, statAvg),
+		msCol("worst", scopeSession, statWorst),
+	},
+	{lossCol(scopeSession), msCol("avg", scopeSession, statAvg)},
+	{lossCol(scopeSession)},
 }
 
 // layout is the responsive column plan for the hop table.
@@ -200,45 +443,28 @@ type layout struct {
 	stats  []statCol
 }
 
-type statCol struct {
-	head string
-	val  func(model.Stats) float64
-}
-
-// statSets are the candidate statistic columns, widest first. A narrow terminal
-// drops numbers rather than the time series: the series is the point of the
-// tool, and the numbers are all in the JSON and the HTML table anyway.
-var statSets = [][]statCol{
-	{
-		{"last", func(s model.Stats) float64 { return s.Last }},
-		{"avg", func(s model.Stats) float64 { return s.Avg }},
-		{"best", func(s model.Stats) float64 { return s.Best }},
-		{"worst", func(s model.Stats) float64 { return s.Worst }},
-	},
-	{
-		{"last", func(s model.Stats) float64 { return s.Last }},
-		{"avg", func(s model.Stats) float64 { return s.Avg }},
-		{"worst", func(s model.Stats) float64 { return s.Worst }},
-	},
-	{
-		{"avg", func(s model.Stats) float64 { return s.Avg }},
-		{"worst", func(s model.Stats) float64 { return s.Worst }},
-	},
-	{
-		{"avg", func(s model.Stats) float64 { return s.Avg }},
-	},
-	{},
+// statsWidth is how many columns a set occupies, including the leading space
+// before each column and the wider gap where the meaning changes.
+func statsWidth(set []statCol) int {
+	w := 0
+	for i, col := range set {
+		if i > 0 && col.scope != set[i-1].scope {
+			w++
+		}
+		w += 1 + statW
+	}
+	return w
 }
 
 // layoutFor picks the widest column set that still leaves room for a hostname
-// and a usable sparkline.
-func layoutFor(cols int) layout {
-	// ttl(3) + gap + host + gap + loss(6) + stats + two gaps + spark
-	const chrome = 3 + 1 + 1 + 6 + 2
-	const minHost, minSpark = 12, 8
+// and a usable time series.
+func layoutFor(cols int, sets [][]statCol) layout {
+	// ttl(3) + gap + host + stats + two gaps + spark
+	const chrome = 3 + 1 + 2
+	const minHost, minSpark = 12, 24
 
-	for _, set := range statSets {
-		rest := cols - chrome - 8*len(set)
+	for _, set := range sets {
+		rest := cols - chrome - statsWidth(set)
 		if rest < minHost+minSpark {
 			continue
 		}
@@ -246,9 +472,97 @@ func layoutFor(cols int) layout {
 		return layout{hostW: hostW, sparkW: rest - hostW, stats: set}
 	}
 	// Narrower than any sane terminal: keep the invariant rather than panicking.
-	rest := max(cols-chrome, minHost+2)
+	set := sets[len(sets)-1]
+	rest := max(cols-chrome-statsWidth(set), minHost+2)
 	hostW := max(min(12, rest-2), 1)
-	return layout{hostW: hostW, sparkW: max(rest-hostW, 1)}
+	return layout{hostW: hostW, sparkW: max(rest-hostW, 1), stats: set}
+}
+
+// hasScope reports whether any column reads the given scope.
+func (lay layout) hasScope(sc scope) bool {
+	for _, col := range lay.stats {
+		if col.scope == sc {
+			return true
+		}
+	}
+	return false
+}
+
+// block lays the statistic columns out, given a function that renders each one.
+// The header, the group rules and every hop row go through it, so they cannot
+// drift out of alignment.
+func (lay layout) block(cell func(col statCol) string) string {
+	var b strings.Builder
+	for i, col := range lay.stats {
+		if i > 0 && col.scope != lay.stats[i-1].scope {
+			b.WriteByte(' ') // a wider gap where the meaning changes
+		}
+		b.WriteByte(' ')
+		b.WriteString(cell(col))
+	}
+	return b.String()
+}
+
+// head is the column-name row.
+func (lay layout) head() string {
+	return fmt.Sprintf("%3s %-*s", "ttl", lay.hostW, "host") +
+		lay.block(func(col statCol) string { return fmt.Sprintf("%*s", statW, col.head) })
+}
+
+// groupHeader draws a labelled rule over each run of columns, so no reader has
+// to guess whether a number means "right now" or "the whole run".
+func (lay layout) groupHeader(c Color, winSpanMS, sessSpanMS float64) string {
+	if len(lay.stats) == 0 {
+		return ""
+	}
+	type span struct {
+		scope    scope
+		from, to int
+	}
+	var spans []span
+	x := 0
+	for i, col := range lay.stats {
+		if i > 0 && col.scope != lay.stats[i-1].scope {
+			x++
+		}
+		x++ // the column's leading space
+		if i == 0 || col.scope != lay.stats[i-1].scope {
+			spans = append(spans, span{scope: col.scope, from: x, to: x + statW})
+		} else {
+			spans[len(spans)-1].to = x + statW
+		}
+		x += statW
+	}
+
+	line := []rune(strings.Repeat(" ", x))
+	for _, sp := range spans {
+		name, spanMS := "window", winSpanMS
+		if sp.scope == scopeSession {
+			name, spanMS = "session", sessSpanMS
+		}
+		copy(line[sp.from:sp.to], []rune(rule(name, spanMS, sp.to-sp.from)))
+	}
+	return strings.Repeat(" ", 3+1+lay.hostW) + c.Dim(string(line))
+}
+
+// rule is a group label and, if there is room, a rule drawn out to the width of
+// the columns it covers. The span is dropped before the name is: a label that
+// says only "session" still tells the reader what the numbers are.
+func rule(name string, spanMS float64, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	full := name + " " + fmtSpan(spanMS)
+	switch {
+	case len(full)+1 <= w:
+		return full + " " + strings.Repeat("─", w-len(full)-1)
+	case len(full) <= w:
+		return full
+	case len(name) <= w:
+		return name
+	default:
+		return string([]rune(name)[:w])
+	}
 }
 
 // elide keeps the first n rows and says how many were dropped, so a truncated
@@ -281,9 +595,11 @@ func fit(lines []string, cols, rows int) []string {
 	return lines
 }
 
-// panels renders the two heatmaps that answer "where" and "when". Only hops
-// that actually show something are listed: a wall of empty rows buries the two
-// that matter.
+// panels renders the two heatmaps that answer "where" and "when". They describe
+// the window, like the graph above them: a hop that lost probes an hour ago and
+// is clean now would otherwise sit here as a row of blanks, pointing at nothing.
+// The hop's whole-run figures are in the session columns, and the findings below
+// cover the run.
 func (v View) panels(c Color, s *model.Session, plan model.Plan, cellsFor map[int][]model.Cell, lay layout, cols int, spanMS float64, budget int) []string {
 	// The heatmap rows reuse the table's ttl and host columns so their cells
 	// line up under the sparklines rather than drifting right.
@@ -298,15 +614,19 @@ func (v View) panels(c Color, s *model.Session, plan model.Plan, cellsFor map[in
 	}
 	var out []string
 
-	lossRows := make([]string, 0, len(s.Hops))
-	for _, h := range s.Hops {
-		if h.Stats.Lost == 0 {
-			continue
-		}
-		lossRows = append(lossRows, fmt.Sprintf("%s %s %s",
+	panelRow := func(h *model.Hop, cells string) string {
+		return fmt.Sprintf("%s %s %s",
 			c.Dim(fmt.Sprintf("%3d", h.TTL)),
 			fmt.Sprintf("%-*s", labelW, truncate(h.Label(), labelW)),
-			HeatRow(c, cellsFor[h.TTL], HeatLoss, 0)))
+			cells)
+	}
+
+	lossRows := make([]string, 0, len(s.Hops))
+	for _, h := range s.Hops {
+		if !lostAny(cellsFor[h.TTL]) {
+			continue
+		}
+		lossRows = append(lossRows, panelRow(h, HeatRow(c, cellsFor[h.TTL], HeatLoss, 0)))
 	}
 	// Each panel gets half of what is left after its own title and the closing
 	// note, so a lossy path cannot squeeze the stall panel off the screen.
@@ -314,7 +634,7 @@ func (v View) panels(c Color, s *model.Session, plan model.Plan, cellsFor map[in
 
 	if len(lossRows) == 0 {
 		out = append(out, c.Dim("  packet loss")+"  "+c.Paint(RoleGood, "none")+
-			c.Dim(fmt.Sprintf("  ·  %s of history", fmtSpan(spanMS))))
+			c.Dim(fmt.Sprintf(" in the last %s", fmtSpan(spanMS))))
 	} else {
 		out = append(out, c.Dim("  "+title("packet loss — where it lands, and when", "packet loss"))+"   "+
 			HeatLegend(c, HeatLoss, "0%", "100%"))
@@ -324,29 +644,58 @@ func (v View) panels(c Color, s *model.Session, plan model.Plan, cellsFor map[in
 	stallRows := make([]string, 0, len(s.Hops))
 	for _, h := range s.Hops {
 		base := h.Baseline()
-		if base <= 0 || h.Stats.Worst < base*warnFactor && h.Stats.Worst < base+warnFloorMS {
+		if !stalledAny(cellsFor[h.TTL], base) {
 			continue
 		}
-		stallRows = append(stallRows, fmt.Sprintf("%s %s %s",
-			c.Dim(fmt.Sprintf("%3d", h.TTL)),
-			fmt.Sprintf("%-*s", labelW, truncate(h.Label(), labelW)),
-			HeatRow(c, cellsFor[h.TTL], HeatStall, base)))
+		stallRows = append(stallRows, panelRow(h, HeatRow(c, cellsFor[h.TTL], HeatStall, base)))
 	}
 	out = append(out, "")
 	if len(stallRows) == 0 {
-		out = append(out, c.Dim("  latency stalls")+"  "+c.Paint(RoleGood, "none"))
+		out = append(out, c.Dim("  latency stalls")+"  "+c.Paint(RoleGood, "none")+
+			c.Dim(fmt.Sprintf(" in the last %s", fmtSpan(spanMS))))
 	} else {
 		out = append(out, c.Dim("  "+title("latency stalls — rtt above each hop's own baseline", "latency stalls"))+"   "+
 			HeatLegend(c, HeatStall, "1.25×", "4×+"))
 		out = append(out, elide(c, stallRows, perPanel)...)
 	}
 
+	note := fmt.Sprintf("  %s of history, 1 round per column", fmtSpan(spanMS))
 	if plan.PerCol > 1 {
-		out = append(out, "", c.Dim(fmt.Sprintf("  %s of history, %d rounds per column (worst wins)", fmtSpan(spanMS), plan.PerCol)))
-	} else {
-		out = append(out, "", c.Dim(fmt.Sprintf("  %s of history, 1 round per column", fmtSpan(spanMS))))
+		note = fmt.Sprintf("  %s of history, %d rounds per column (worst wins)", fmtSpan(spanMS), plan.PerCol)
 	}
+	if s.SamplesFrom > 0 {
+		// The session columns still cover every probe; only the drawable time
+		// series was capped. Saying which is which is the difference between a
+		// bounded tool and a lying one.
+		note += fmt.Sprintf("  ·  probe-by-probe history kept from round %d (--history)", s.SamplesFrom)
+	}
+	out = append(out, "", c.Dim(note))
 	return out
+}
+
+// lostAny reports whether any drawn column lost a probe.
+func lostAny(cells []model.Cell) bool {
+	for _, cell := range cells {
+		if cell.Lost > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// stalledAny reports whether any drawn column sat far enough above the hop's own
+// baseline to be worth a panel row.
+func stalledAny(cells []model.Cell, base float64) bool {
+	if base <= 0 {
+		return false
+	}
+	limit := max(base*warnFactor, base+warnFloorMS)
+	for _, cell := range cells {
+		if cell.MaxRTT >= limit {
+			return true
+		}
+	}
+	return false
 }
 
 // --- shared -----------------------------------------------------------------
@@ -360,8 +709,10 @@ func (v View) header(c Color, s *model.Session, cols int) string {
 	if name != "" && name != s.TargetIP {
 		target = fmt.Sprintf("%s (%s)", name, s.TargetIP)
 	}
-	meta := fmt.Sprintf("round %d · every %s · timeout %s",
-		s.Rounds, fmtSpan(s.IntervalMS), fmtSpan(s.TimeoutMS))
+	// The elapsed time is in the header because it is what the session columns
+	// and the findings are averaged over.
+	meta := fmt.Sprintf("round %d · %s · every %s · timeout %s",
+		s.Rounds, fmtSpan(s.Elapsed()), fmtSpan(s.IntervalMS), fmtSpan(s.TimeoutMS))
 
 	// Shed detail from the right rather than letting the line be cut: the
 	// target is what the reader needs, the timeout is not.
@@ -369,7 +720,7 @@ func (v View) header(c Color, s *model.Session, cols int) string {
 	if len(full) <= cols {
 		return c.Bold("puffy "+s.Mode) + " " + c.Paint(RoleSecondary, target) + "  " + c.Dim(meta)
 	}
-	short := fmt.Sprintf("round %d · every %s", s.Rounds, fmtSpan(s.IntervalMS))
+	short := fmt.Sprintf("round %d · %s · every %s", s.Rounds, fmtSpan(s.Elapsed()), fmtSpan(s.IntervalMS))
 	if len(fmt.Sprintf("puffy %s %s  %s", s.Mode, target, short)) <= cols {
 		return c.Bold("puffy "+s.Mode) + " " + c.Paint(RoleSecondary, target) + "  " + c.Dim(short)
 	}

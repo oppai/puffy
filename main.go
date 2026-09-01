@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -46,13 +47,15 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ir := watchInterrupts(cancel)
+	defer ir.stop()
 
 	var err error
 	switch os.Args[1] {
 	case "ping", "trace":
-		err = runProbe(ctx, os.Args[1], os.Args[2:])
+		err = runProbe(ctx, os.Args[1], os.Args[2:], ir)
 	case "render":
 		err = runRender(os.Args[2:])
 	case "version", "--version", "-v":
@@ -68,6 +71,50 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// interrupt gives Ctrl-C two meanings. The first one ends the run and lets the
+// session be summarised and written out; the second one gives up on that and
+// leaves at once. Both are needed: installing a handler switches off Go's own
+// "die on SIGINT", so without the second signal a slow teardown - or a bug in
+// one - reads as a tool that ignores Ctrl-C entirely.
+type interrupt struct {
+	sig  chan os.Signal
+	mu   sync.Mutex
+	last func()
+}
+
+func watchInterrupts(cancel func()) *interrupt {
+	ir := &interrupt{sig: make(chan os.Signal, 2)}
+	signal.Notify(ir.sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if _, ok := <-ir.sig; !ok {
+			return
+		}
+		cancel()
+		if _, ok := <-ir.sig; !ok {
+			return
+		}
+		ir.mu.Lock()
+		last := ir.last
+		ir.mu.Unlock()
+		if last != nil {
+			last() // put the terminal back before walking out of it
+		}
+		os.Exit(130) // 128 + SIGINT, what a shell expects
+	}()
+	return ir
+}
+
+// OnForce registers what to run if the user insists. It is the terminal's
+// restore, so the second Ctrl-C does not leave the shell on the alternate
+// screen with no cursor.
+func (ir *interrupt) OnForce(fn func()) {
+	ir.mu.Lock()
+	ir.last = fn
+	ir.mu.Unlock()
+}
+
+func (ir *interrupt) stop() { signal.Stop(ir.sig) }
 
 // reorder moves operands after flags. The standard flag package stops parsing
 // at the first non-flag argument, but `puffy ping 8.8.8.8 -c 5` is how people
@@ -117,6 +164,7 @@ type options struct {
 	priv     bool
 	noDNS    bool
 	window   int
+	history  int
 	jsonPath string
 	htmlPath string
 	theme    string
@@ -125,7 +173,7 @@ type options struct {
 	plain    bool
 }
 
-func runProbe(ctx context.Context, mode string, args []string) error {
+func runProbe(ctx context.Context, mode string, args []string, ir *interrupt) error {
 	fs := flag.NewFlagSet("puffy "+mode, flag.ExitOnError)
 	var o options
 
@@ -141,7 +189,9 @@ func runProbe(ctx context.Context, mode string, args []string) error {
 	fs.BoolVar(&o.v6, "6", false, "resolve the target to IPv6")
 	fs.BoolVar(&o.priv, "privileged", false, "use a raw socket (needs root or CAP_NET_RAW)")
 	fs.BoolVar(&o.noDNS, "no-dns", false, "skip reverse DNS lookups for hop names")
-	fs.IntVar(&o.window, "window", 0, "rounds of history to graph (0 fits the terminal)")
+	fs.IntVar(&o.window, "window", 0, "rounds of history to graph (0 shows a fixed trailing window)")
+	fs.IntVar(&o.history, "history", probe.DefaultConfig().History,
+		"rounds of raw samples to keep for the graphs and the saved session (0 keeps every round)")
 	fs.StringVar(&o.jsonPath, "json", "", `write the session as JSON to this path ("-" for stdout)`)
 	fs.StringVar(&o.htmlPath, "html", "", `write an HTML report to this path ("-" for stdout)`)
 	fs.StringVar(&o.theme, "theme", "auto", "colour theme for the graphs: auto, dark or light")
@@ -196,6 +246,12 @@ func runProbe(ctx context.Context, mode string, args []string) error {
 	cfg.Count = o.count
 	cfg.PayloadSize = o.size
 	cfg.Privileged = o.priv
+	cfg.History = o.history
+	if o.window > cfg.History && cfg.History > 0 {
+		// A graph window wider than the history it is drawn from would show
+		// blank columns for rounds that were thrown away.
+		cfg.History = o.window
+	}
 	if mode == "ping" {
 		cfg.TTL = o.ttl
 	} else {
@@ -222,7 +278,8 @@ func runProbe(ctx context.Context, mode string, args []string) error {
 
 	screen := tui.NewScreen(humanOut, o.theme, o.color, o.noColor)
 	live := screen.IsTTY() && !o.plain
-	view := tui.View{Screen: screen, Window: o.window}
+	view := tui.View{Screen: screen, Window: o.window, Interval: o.interval}
+	ir.OnForce(screen.RestoreTerminal)
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- eng.Run(ctx) }()
@@ -246,6 +303,7 @@ func runProbe(ctx context.Context, mode string, args []string) error {
 	defer redraw.Stop()
 
 	results := eng.Results()
+	done := ctx.Done()
 	for results != nil {
 		select {
 		case r, ok := <-results:
@@ -259,7 +317,19 @@ func runProbe(ctx context.Context, mode string, args []string) error {
 			}
 		case <-redraw.C:
 			if live {
-				screen.Frame(view.Live(collector.Snapshot()))
+				// Only the window being drawn is snapshotted, so a frame costs
+				// the same after six hours as after six seconds.
+				screen.Frame(view.Live(collector.Snapshot(view.WindowRounds(mode))))
+			}
+		case <-done:
+			// Give the terminal back the moment the user asks for it, and stop
+			// drawing. What is left is draining the probes already on the wire,
+			// which the engine bounds.
+			done = nil
+			redraw.Stop()
+			if live {
+				screen.LeaveAlt()
+				live = false
 			}
 		}
 	}
@@ -275,7 +345,7 @@ func runProbe(ctx context.Context, mode string, args []string) error {
 	if session.Rounds == 0 {
 		return errors.New("no probes completed")
 	}
-	if !o.plain || live {
+	if !o.plain {
 		screen.Print(view.Summary(session))
 	}
 

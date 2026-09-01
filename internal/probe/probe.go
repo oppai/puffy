@@ -82,11 +82,24 @@ type Config struct {
 	// PayloadSize is the ICMP payload length in bytes, matching ping's -s.
 	PayloadSize int
 
+	// History is how many trailing rounds of raw probe samples to keep. The
+	// per-hop statistics are folded as probes arrive and stay exact for the whole
+	// run whatever this is; what it bounds is the time series a long session can
+	// draw and write out. 0 keeps everything, and lets an unattended run grow
+	// until the machine complains.
+	History int
+
 	// Privileged opens a raw socket instead of the unprivileged datagram
 	// socket. Raw sockets see every ICMP packet on the host, so replies must
 	// then be filtered by echo ID.
 	Privileged bool
 }
+
+// defaultHistory is the rolling raw history a run keeps when the caller does
+// not choose: long enough that the graphs and the saved session cover hours of
+// a real incident, short enough that an overnight trace stays in tens of
+// megabytes instead of gigabytes.
+const defaultHistory = 50000
 
 // DefaultConfig returns the settings both subcommands start from.
 func DefaultConfig() Config {
@@ -97,6 +110,7 @@ func DefaultConfig() Config {
 		FirstTTL:    1,
 		MaxTTL:      30,
 		PayloadSize: 56,
+		History:     defaultHistory,
 	}
 }
 
@@ -112,6 +126,9 @@ func (c *Config) validate() error {
 	}
 	if c.PayloadSize < 0 || c.PayloadSize > 65000 {
 		return fmt.Errorf("payload size %d out of range", c.PayloadSize)
+	}
+	if c.History < 0 {
+		return fmt.Errorf("history %d rounds is negative", c.History)
 	}
 	switch c.Mode {
 	case "ping":

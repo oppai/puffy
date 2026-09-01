@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"strings"
@@ -273,4 +274,163 @@ func TestEyeball(t *testing.T) {
 	p.Recompute()
 	pv := View{Screen: testScreen(t, 110, 30, true)}
 	t.Log("\n" + strings.Join(pv.Live(p), "\n"))
+}
+
+// percentFields are the loss columns of a hop row, in order: the window's first,
+// then the session's.
+func percentFields(row string) []string {
+	var out []string
+	for _, f := range strings.Fields(row) {
+		if strings.HasSuffix(f, "%") {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// runeIndex is where sub starts in printable columns. The group rules are drawn
+// with box characters, so a byte offset would not be a column.
+func runeIndex(s, sub string) int {
+	i := strings.Index(s, sub)
+	if i < 0 {
+		return -1
+	}
+	return len([]rune(s[:i]))
+}
+
+// rowFor finds the table row for a ttl.
+func rowFor(lines []string, ttl int) string {
+	for _, l := range lines {
+		txt := strip(l)
+		if strings.HasPrefix(txt, fmt.Sprintf("%3d ", ttl)) {
+			return txt
+		}
+	}
+	return ""
+}
+
+// The live trace graph must show a fixed stretch of time however long the run
+// has been going. Letting it cover "everything so far" is what made a long
+// session's picture stop moving: every column kept absorbing more rounds.
+func TestLiveTraceWindowDoesNotGrowWithTheSession(t *testing.T) {
+	note := func(rounds int) string {
+		v := View{Screen: testScreen(t, 120, 30, true)}
+		for _, l := range v.Live(synthetic(rounds)) {
+			if txt := strip(l); strings.Contains(txt, "of history,") {
+				return strings.TrimSpace(txt)
+			}
+		}
+		t.Fatalf("rounds=%d: the frame does not say what it is showing", rounds)
+		return ""
+	}
+	short, long := note(120), note(60000)
+	if short != long {
+		t.Errorf("the graph changed shape as the run went on:\n  120 rounds: %s\n  60000 rounds: %s", short, long)
+	}
+	if !strings.HasPrefix(short, "1m of history") {
+		t.Errorf("the live window is %q, want the fixed one-minute window", short)
+	}
+}
+
+// The whole point of the split: a hop that lost probes an hour ago and is fine
+// now must read as fine now and lossy over the run. One set of numbers cannot
+// say both.
+func TestHopRowSeparatesWindowFromSession(t *testing.T) {
+	s := synthetic(400) // the loss burst is at rounds 200..250, long out of window
+	v := View{Screen: testScreen(t, 120, 30, true)}
+	row := rowFor(v.Live(s), 5)
+	if row == "" {
+		t.Fatal("the lossy hop has no row")
+	}
+	got := percentFields(row)
+	if len(got) != 2 {
+		t.Fatalf("row has %d loss columns, want the window's and the session's: %q", len(got), row)
+	}
+	if got[0] != "0.0%" {
+		t.Errorf("window loss = %s, want 0.0%%: nothing was lost in the last minute (%q)", got[0], row)
+	}
+	if got[1] == "0.0%" {
+		t.Errorf("session loss = %s, want the loss the run actually saw (%q)", got[1], row)
+	}
+}
+
+// The group rules have to sit over the columns they describe, or they would
+// mislabel the numbers they are there to explain.
+func TestGroupHeaderLinesUpWithItsColumns(t *testing.T) {
+	v := View{Screen: testScreen(t, 120, 30, true)}
+	lines := v.Live(synthetic(400))
+	var group, head string
+	for i, l := range lines {
+		if txt := strip(l); strings.Contains(txt, "window") && strings.Contains(txt, "session") {
+			group, head = txt, strip(lines[i+1])
+			break
+		}
+	}
+	if group == "" {
+		t.Fatalf("no group header:\n%s", strip(strings.Join(lines, "\n")))
+	}
+	if !strings.HasPrefix(strings.TrimSpace(head), "ttl host") {
+		t.Fatalf("the row under the group header is not the column header: %q", head)
+	}
+	first := runeIndex(head, "loss")
+	second := runeIndex(head[strings.Index(head, "loss")+1:], "loss") + first + 1
+	// A column's value is right-aligned in seven columns, and the group rule
+	// starts at the space before it.
+	if got, want := runeIndex(group, "window"), first-3; got != want {
+		t.Errorf("the window rule starts at column %d, but its first column is at %d\n%s\n%s", got, want, group, head)
+	}
+	if got, want := runeIndex(group, "session"), second-3; got != want {
+		t.Errorf("the session rule starts at column %d, but its first column is at %d\n%s\n%s", got, want, group, head)
+	}
+}
+
+// The summary is the long-term report, so its columns are the session's. Two
+// identical groups side by side would only cost the graph its width.
+func TestSummaryColumnsAreSessionScoped(t *testing.T) {
+	v := View{Screen: testScreen(t, 120, 40, true)}
+	lines := v.Summary(synthetic(400))
+	row := rowFor(lines, 5)
+	if got := percentFields(row); len(got) != 1 {
+		t.Errorf("summary row has %d loss columns, want one: %q", len(got), row)
+	}
+	joined := strip(strings.Join(lines, "\n"))
+	if !strings.Contains(joined, "session") {
+		t.Errorf("the summary never says its numbers cover the session:\n%s", joined)
+	}
+}
+
+// The heatmaps are drawn from the window, so their row list has to come from the
+// window too - a hop that is quiet now would otherwise take up a row of blanks.
+func TestPanelsDescribeTheWindowNotTheSession(t *testing.T) {
+	v := View{Screen: testScreen(t, 120, 30, true)}
+	joined := strip(strings.Join(v.Live(synthetic(400)), "\n"))
+	if !strings.Contains(joined, "packet loss  none in the last 1m") {
+		t.Errorf("a window with no loss should say so, and say over what:\n%s", joined)
+	}
+	// And with the trouble inside the window, the panel lists the hop.
+	joined = strip(strings.Join(v.Live(synthetic(60)), "\n"))
+	if !strings.Contains(joined, "packet loss —") {
+		t.Errorf("loss inside the window is not listed:\n%s", joined)
+	}
+}
+
+// A fast interval must not turn the fixed window into a frame that reads a
+// million probes: the graph cannot show more than its columns can hold.
+func TestTraceWindowIsCappedByWhatAColumnCanSay(t *testing.T) {
+	const sparkW = 30
+	if got := traceWindow(sparkW, 1000, 0); got != 60 {
+		t.Errorf("at 1s a round the window is %d rounds, want the 60 in a minute", got)
+	}
+	if got := traceWindow(sparkW, 10, 0); got != 6000 {
+		t.Errorf("at 10ms a round the window is %d rounds, want the 6000 in a minute", got)
+	}
+	if got := traceWindow(sparkW, 1, 0); got != sparkW*maxLiveFold {
+		t.Errorf("at 1ms a round the window is %d rounds, want it capped at %d", got, sparkW*maxLiveFold)
+	}
+	if got := traceWindow(sparkW, 30000, 0); got != sparkW {
+		t.Errorf("at 30s a round the window is %d rounds, want a screenful (%d)", got, sparkW)
+	}
+	if got := traceWindow(sparkW, 1, 12345); got != 12345 {
+		t.Error("an explicit --window must be obeyed as given")
+	}
 }

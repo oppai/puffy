@@ -44,9 +44,13 @@ func (s *Session) PlanCols(cols, window int) Plan {
 	if total < 1 {
 		total = 1
 	}
-	// The visible span is limited by the window, and by how many rounds one
-	// screen of columns can hold without folding more than we have to.
-	span := total
+	// The visible span is limited by the window, by how many rounds one screen
+	// of columns can hold without folding more than we have to, and by how far
+	// back the raw samples still reach on a long run.
+	span := s.RetainedRounds()
+	if span > total {
+		span = total
+	}
 	if window > 0 && window < span {
 		span = window
 	}
@@ -89,7 +93,10 @@ func (h *Hop) Cells(p Plan) []Cell {
 		cells[i].Col = i
 		cells[i].FromMS = math.NaN()
 	}
-	for _, s := range h.Samples {
+	// Range, not every sample: on a long run the samples outside the plan
+	// outnumber the ones in it by orders of magnitude, and a redraw that walks
+	// them all is a redraw that gets slower every hour.
+	for _, s := range h.Range(p) {
 		c := p.Col(s.Round)
 		if c < 0 {
 			continue
@@ -130,6 +137,18 @@ func (h *Hop) Window(n int) []Sample {
 		return h.Samples
 	}
 	return h.Samples[len(h.Samples)-n:]
+}
+
+// Range returns the samples the plan draws, oldest first. Samples are held in
+// round order, so this is a subslice rather than a copy: the window statistics
+// beside a graph cost the window, not the run.
+func (h *Hop) Range(p Plan) []Sample {
+	lo := sort.Search(len(h.Samples), func(i int) bool { return h.Samples[i].Round >= p.FirstRound })
+	hi := sort.Search(len(h.Samples), func(i int) bool { return h.Samples[i].Round > p.LastRound })
+	if lo >= hi {
+		return nil
+	}
+	return h.Samples[lo:hi]
 }
 
 // stallFactor is how far above its own baseline a hop's latency must sit before

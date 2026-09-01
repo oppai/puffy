@@ -194,21 +194,29 @@ func (e *Engine) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			// Deliberately not an error: Ctrl-C is how an unbounded run ends,
 			// and the caller still wants the session it has collected.
-			e.drain()
+			//
+			// The wait is short here, unlike the one below. A run that ends
+			// because the user asked should not pause for a whole timeout first:
+			// replies already on the wire are still counted, and the handful of
+			// probes that never land are dropped rather than scored as loss.
+			e.drainFor(cancelDrain)
 			return nil
 		case <-ticker.C:
 		}
 	}
 
 	// Let the last round's probes finish rather than reporting them as lost.
-	e.drain()
+	e.drainFor(e.cfg.Timeout + 250*time.Millisecond)
 	return nil
 }
 
-// drain waits for outstanding probes to answer or time out, so the final round
-// is not scored as loss just because the run ended.
-func (e *Engine) drain() {
-	deadline := time.NewTimer(e.cfg.Timeout + 250*time.Millisecond)
+// cancelDrain is how long an interrupted run waits for probes already sent.
+const cancelDrain = 250 * time.Millisecond
+
+// drainFor waits up to d for outstanding probes to answer or time out, so the
+// final round is not scored as loss just because the run ended.
+func (e *Engine) drainFor(d time.Duration) {
+	deadline := time.NewTimer(d)
 	defer deadline.Stop()
 	for {
 		e.mu.Lock()

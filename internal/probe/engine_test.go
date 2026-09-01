@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"encoding/binary"
+	"math"
 	"net/netip"
 	"testing"
 	"time"
@@ -192,7 +193,7 @@ func TestCollectorOrdersOutOfOrderResults(t *testing.T) {
 	c.Add(result(0, 1, "10.0.0.1", 1*time.Millisecond, KindTimeExceeded))
 	c.Add(result(1, 1, "10.0.0.1", 2*time.Millisecond, KindTimeExceeded))
 
-	hop := c.Snapshot().Hops[0]
+	hop := c.Snapshot(0).Hops[0]
 	for i, s := range hop.Samples {
 		if s.Round != i {
 			t.Fatalf("samples out of order: %d at index %d", s.Round, i)
@@ -208,7 +209,7 @@ func TestCollectorRecordsEveryAddressAtAHop(t *testing.T) {
 	c.Add(result(1, 3, "10.0.0.2", time.Millisecond, KindTimeExceeded))
 	c.Add(result(2, 3, "10.0.0.1", time.Millisecond, KindTimeExceeded))
 
-	hop := c.Snapshot().Hops[0]
+	hop := c.Snapshot(0).Hops[0]
 	if len(hop.Addrs) != 2 {
 		t.Errorf("addrs = %v, want the two distinct addresses", hop.Addrs)
 	}
@@ -226,7 +227,7 @@ func TestCollectorDropsHopsPastDestination(t *testing.T) {
 		}
 		c.Add(result(0, ttl, from, time.Millisecond, kind))
 	}
-	s := c.Snapshot()
+	s := c.Snapshot(0)
 	if len(s.Hops) != 4 {
 		t.Fatalf("kept %d hops, want 4 (the path ends at the first ttl that reached the target)", len(s.Hops))
 	}
@@ -241,7 +242,7 @@ func TestCollectorScoresTimeoutAsLoss(t *testing.T) {
 	c.Add(result(1, 64, "", 0, KindTimeout))
 	c.Add(result(2, 64, "192.0.2.1", 12*time.Millisecond, KindEcho))
 
-	st := c.Snapshot().Hops[0].Stats
+	st := c.Snapshot(0).Hops[0].Stats
 	if st.Sent != 3 || st.Recv != 2 || st.Lost != 1 {
 		t.Errorf("sent/recv/lost = %d/%d/%d, want 3/2/1", st.Sent, st.Recv, st.Lost)
 	}
@@ -252,7 +253,7 @@ func TestCollectorScoresTimeoutAsLoss(t *testing.T) {
 func TestCollectorCountsUnreachableAsAReply(t *testing.T) {
 	c := testCollector(t, "trace")
 	c.Add(result(0, 5, "10.0.0.5", 7*time.Millisecond, KindUnreachable))
-	st := c.Snapshot().Hops[0].Stats
+	st := c.Snapshot(0).Hops[0].Stats
 	if st.Recv != 1 || st.Lost != 0 {
 		t.Errorf("recv/lost = %d/%d, want 1/0", st.Recv, st.Lost)
 	}
@@ -342,5 +343,163 @@ func TestEngineCancelIsNotAnError(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Errorf("cancelled run returned an error: %v", err)
+	}
+}
+
+// A run that lasts long enough to trim its raw history must not lose track of
+// what it measured. The samples are a rolling window; the statistics are not.
+func TestCollectorStatsStayExactAfterHistoryIsTrimmed(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Mode = "ping"
+	cfg.Target = "192.0.2.1"
+	cfg.IP = netip.MustParseAddr("192.0.2.1")
+	cfg.Interval = time.Second
+	cfg.Timeout = 2 * time.Second
+	cfg.History = 100
+	c := NewCollector(cfg, false)
+
+	const rounds = 5000
+	sent, recv, lost := 0, 0, 0
+	var sum, worst float64
+	for r := range rounds {
+		sent++
+		if r%50 == 0 {
+			lost++
+			c.Add(result(r, 64, "", 0, KindTimeout))
+			continue
+		}
+		recv++
+		rtt := time.Duration(10+r%40) * time.Millisecond
+		ms := float64(rtt) / float64(time.Millisecond)
+		sum += ms
+		worst = max(worst, ms)
+		c.Add(result(r, 64, "192.0.2.1", rtt, KindEcho))
+	}
+
+	s := c.Finish()
+	hop := s.Hops[0]
+	st := hop.Stats
+	if st.Sent != sent || st.Recv != recv || st.Lost != lost {
+		t.Errorf("sent/recv/lost = %d/%d/%d, want %d/%d/%d over the whole run",
+			st.Sent, st.Recv, st.Lost, sent, recv, lost)
+	}
+	if want := sum / float64(recv); math.Abs(st.Avg-want) > 1e-9 {
+		t.Errorf("avg = %v, want %v", st.Avg, want)
+	}
+	if st.Worst != worst {
+		t.Errorf("worst = %v, want %v", st.Worst, worst)
+	}
+	// And the raw history really is bounded, or none of the above would matter.
+	if len(hop.Samples) > cfg.History+cfg.History/4 {
+		t.Errorf("kept %d samples for a %d-round history", len(hop.Samples), cfg.History)
+	}
+	if s.SamplesFrom == 0 {
+		t.Error("the session does not record that its oldest samples were dropped")
+	}
+	if got := s.Rounds - s.SamplesFrom; got != len(hop.Samples) {
+		t.Errorf("retained span is %d rounds but %d samples were written", got, len(hop.Samples))
+	}
+}
+
+// A redraw asks for the window it is about to draw, and must get that and not
+// the run: this is what stops the frame cost growing with the session.
+func TestCollectorSnapshotMaterialisesOnlyTheWindow(t *testing.T) {
+	c := testCollector(t, "trace")
+	for r := range 4000 {
+		for ttl := 1; ttl <= 3; ttl++ {
+			c.Add(result(r, ttl, "10.0.0.1", time.Millisecond, KindTimeExceeded))
+		}
+	}
+	s := c.Snapshot(120)
+	for _, h := range s.Hops {
+		if len(h.Samples) != 120 {
+			t.Errorf("ttl %d materialised %d samples for a 120-round window", h.TTL, len(h.Samples))
+		}
+		if first := h.Samples[0].Round; first != 4000-120 {
+			t.Errorf("ttl %d window starts at round %d, want %d", h.TTL, first, 4000-120)
+		}
+		// The statistics still describe the whole run, not the window.
+		if h.Stats.Sent != 4000 {
+			t.Errorf("ttl %d reports %d probes sent, want all 4000", h.TTL, h.Stats.Sent)
+		}
+	}
+	if s.SamplesFrom != 4000-120 {
+		t.Errorf("SamplesFrom = %d, want %d", s.SamplesFrom, 4000-120)
+	}
+}
+
+// A timeout only lands a whole timeout after it was sent, so a lossy hop's
+// results arrive out of round order. Each one must be counted once, in the right
+// place, and must still break the jitter chain.
+func TestCollectorFoldsLateTimeoutsInRoundOrder(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Mode = "ping"
+	cfg.Target = "192.0.2.1"
+	cfg.IP = netip.MustParseAddr("192.0.2.1")
+	cfg.Interval = 200 * time.Millisecond
+	cfg.Timeout = 2 * time.Second
+	c := NewCollector(cfg, false)
+
+	// Round 5's probe is lost, so it is only reported when its timeout fires -
+	// 2s later, which at 200ms a round is ten rounds after it was sent. Every
+	// other round replies immediately.
+	for r := range 16 {
+		if r == 5 {
+			continue
+		}
+		c.Add(result(r, 64, "192.0.2.1", time.Duration(10+r)*time.Millisecond, KindEcho))
+	}
+	c.Add(result(5, 64, "", 0, KindTimeout))
+	for r := 16; r < 40; r++ {
+		c.Add(result(r, 64, "192.0.2.1", time.Duration(10+r)*time.Millisecond, KindEcho))
+	}
+
+	s := c.Finish()
+	hop := s.Hops[0]
+	if st := hop.Stats; st.Sent != 40 || st.Recv != 39 || st.Lost != 1 {
+		t.Errorf("sent/recv/lost = %d/%d/%d, want 40/39/1", st.Sent, st.Recv, st.Lost)
+	}
+	for i, sm := range hop.Samples {
+		if sm.Round != i {
+			t.Fatalf("samples out of order: round %d at index %d", sm.Round, i)
+		}
+	}
+	if !hop.Samples[5].Lost() {
+		t.Error("the late timeout was not recorded at its own round")
+	}
+	// Rounds step by 1ms, so every consecutive pair differs by 1 - except the
+	// pair either side of the lost round, which must not be paired at all.
+	if j := hop.Stats.Jitter; math.Abs(j-1) > 1e-9 {
+		t.Errorf("jitter = %v, want 1: the pair across the lost round was counted", j)
+	}
+}
+
+// A result that arrives even later than a timeout can explain - the engine
+// bounds it, but nothing in the collector may assume it - is still counted
+// exactly once and still lands at its own round in the time series.
+func TestCollectorCountsResultsThatArriveBeyondTheTimeoutBound(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Mode = "ping"
+	cfg.Target = "192.0.2.1"
+	cfg.IP = netip.MustParseAddr("192.0.2.1")
+	cfg.Interval = 200 * time.Millisecond
+	cfg.Timeout = 400 * time.Millisecond // a lag of four rounds
+	c := NewCollector(cfg, false)
+
+	for r := range 40 {
+		if r == 2 {
+			continue
+		}
+		c.Add(result(r, 64, "192.0.2.1", 10*time.Millisecond, KindEcho))
+	}
+	c.Add(result(2, 64, "", 0, KindTimeout)) // 38 rounds late
+
+	s := c.Finish()
+	hop := s.Hops[0]
+	if st := hop.Stats; st.Sent != 40 || st.Recv != 39 || st.Lost != 1 {
+		t.Errorf("sent/recv/lost = %d/%d/%d, want 40/39/1", st.Sent, st.Recv, st.Lost)
+	}
+	if len(hop.Samples) != 40 || !hop.Samples[2].Lost() {
+		t.Errorf("the very late timeout is not at round 2: %d samples", len(hop.Samples))
 	}
 }

@@ -99,6 +99,18 @@ func (s *Screen) LeaveAlt() {
 	fmt.Fprint(s.out, "\x1b[?25h\x1b[?1049l")
 }
 
+// RestoreTerminal undoes EnterAlt by writing the sequences directly, touching
+// none of the screen's own state. That makes it safe to call from a signal
+// handler while a frame is being painted - which is exactly when it is needed,
+// because the second Ctrl-C must not leave the shell on the alternate screen
+// with no cursor.
+func (s *Screen) RestoreTerminal() {
+	if !s.tty {
+		return
+	}
+	io.WriteString(s.out, "\x1b[?25h\x1b[?1049l")
+}
+
 // Frame paints the given lines. Lines longer than the terminal are left alone:
 // the callers size their own content, and silently truncating a graph is worse
 // than letting one row wrap while the window is mid-resize.
