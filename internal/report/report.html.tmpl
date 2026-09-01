@@ -859,9 +859,14 @@ function init() {
   document.getElementById("title").textContent =
     `puffy ${DATA.mode} — ${DATA.target_name || DATA.target || DATA.target_ip}`;
   const started = new Date(DATA.started_at);
+  const kept = DATA.rounds - (DATA.samples_from_round || 0);
   document.getElementById("subtitle").textContent =
     `${DATA.target_ip} · ${DATA.rounds} rounds every ${fmtDur(DATA.interval_ms)} · ` +
-    `${fmtDur(new Date(DATA.ended_at) - started)} from ${started.toLocaleString()}`;
+    `${fmtDur(new Date(DATA.ended_at) - started)} from ${started.toLocaleString()}` +
+    // A long run keeps a rolling raw history, so the charts can cover less than
+    // the run did. The hop table's own figures come from the samples too, so the
+    // reader has to be told which stretch that is.
+    (kept < DATA.rounds ? ` · charts cover the last ${kept} rounds` : "");
   document.getElementById("gen-version").textContent = DATA.version || "";
   document.getElementById("gen-when").textContent = new Date(DATA.ended_at).toLocaleString();
   document.title = `puffy ${DATA.mode} ${DATA.target_ip}`;

@@ -236,3 +236,86 @@ func TestBaselineIsLowPercentileNotMinimum(t *testing.T) {
 }
 
 func ptr(v float64) *float64 { return &v }
+
+// The live graph has to keep scrolling however long the run goes on. A window
+// given in rounds must therefore fix both the span and the folding, so column
+// zero means "a minute ago" at hour six exactly as it did at minute one.
+func TestPlanColsWithWindowIsFixedHoweverLongTheRun(t *testing.T) {
+	const cols, window = 30, 60
+	var first Plan
+	for i, rounds := range []int{100, 1000, 100000} {
+		s := session(hop(1, "10.0.0.1", 5, strings.Repeat(".", 200)))
+		s.Rounds = rounds // as if the run had been going for hours
+		s.SamplesFrom = rounds - 200
+		p := s.PlanCols(cols, window)
+		if i == 0 {
+			first = p
+		}
+		if p.PerCol != first.PerCol || p.Cols != first.Cols {
+			t.Errorf("rounds=%d gave Cols=%d PerCol=%d, want the same %d/%d as a short run: the graph would fold itself flat",
+				rounds, p.Cols, p.PerCol, first.Cols, first.PerCol)
+		}
+		if got := p.LastRound - p.FirstRound + 1; got != window {
+			t.Errorf("rounds=%d spans %d rounds, want the %d-round window", rounds, got, window)
+		}
+		if p.LastRound != rounds-1 {
+			t.Errorf("rounds=%d ends at round %d, want the newest round %d", rounds, p.LastRound, rounds-1)
+		}
+	}
+}
+
+// Rounds whose samples have been trimmed must not get columns: a graph that
+// reserves half its width for blanks has thrown away half its width.
+func TestPlanColsIgnoresTrimmedRounds(t *testing.T) {
+	s := session(hop(1, "10.0.0.1", 5, strings.Repeat(".", 40)))
+	s.Rounds = 1000
+	s.SamplesFrom = 960 // only the last 40 rounds are still held
+	p := s.PlanCols(20, 0)
+	if p.FirstRound < s.SamplesFrom {
+		t.Errorf("plan starts at round %d, before the oldest sample at %d", p.FirstRound, s.SamplesFrom)
+	}
+	if p.PerCol != 2 {
+		t.Errorf("40 retained rounds into 20 columns gave PerCol=%d, want 2", p.PerCol)
+	}
+}
+
+func TestRangeReturnsExactlyThePlannedRounds(t *testing.T) {
+	h := hop(1, "10.0.0.1", 5, strings.Repeat(".", 100))
+	p := Plan{Cols: 10, FirstRound: 40, LastRound: 49, PerCol: 1}
+	got := h.Range(p)
+	if len(got) != 10 {
+		t.Fatalf("range covered %d samples, want 10", len(got))
+	}
+	if got[0].Round != 40 || got[len(got)-1].Round != 49 {
+		t.Errorf("range spans rounds %d..%d, want 40..49", got[0].Round, got[len(got)-1].Round)
+	}
+}
+
+// Cells must cost the window, not the run. Walking every sample on every redraw
+// is what made a long session's graph stop moving.
+func TestCellsDoNotWalkTheWholeHistory(t *testing.T) {
+	h := hop(1, "10.0.0.1", 5, strings.Repeat(".", 100000))
+	p := Plan{Cols: 10, FirstRound: 99990, LastRound: 99999, PerCol: 1}
+	allocs := testing.AllocsPerRun(20, func() { h.Cells(p) })
+	cells := h.Cells(p)
+	if cells[0].Sent != 1 || cells[9].Sent != 1 {
+		t.Fatalf("the plan's own rounds are missing: %+v", cells)
+	}
+	// Two slices for the cells themselves, and nothing that scales with history.
+	if allocs > 4 {
+		t.Errorf("Cells allocated %v times for a 10-column plan", allocs)
+	}
+}
+
+// The baseline is a whole-session figure, so it comes from the folded statistics
+// when they are there rather than being re-derived from whatever samples remain.
+func TestBaselineUsesSessionStatsWhenComputed(t *testing.T) {
+	h := &Hop{TTL: 1, Stats: Stats{Sent: 1000, Recv: 1000, P20: 12.5}}
+	for i, v := range []float64{500, 500, 500} { // a stalling window
+		val := v
+		h.Samples = append(h.Samples, Sample{Round: i, RTTMS: &val})
+	}
+	if got := h.Baseline(); got != 12.5 {
+		t.Errorf("baseline = %v, want the session's 12.5: a window baseline would drift up with the stall", got)
+	}
+}

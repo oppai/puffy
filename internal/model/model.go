@@ -23,8 +23,14 @@ type Session struct {
 	IntervalMS float64   `json:"interval_ms"`
 	TimeoutMS  float64   `json:"timeout_ms"`
 	Rounds     int       `json:"rounds"`
-	Hops       []*Hop    `json:"hops"`
-	Insights   []Insight `json:"insights,omitempty"`
+	// SamplesFrom is the first round that still carries raw samples. A long run
+	// trims its oldest probes to stay bounded, so Rounds counts what was
+	// measured while this says how far back the time series itself reaches. The
+	// per-hop Stats stay exact either way: they are folded as probes arrive, not
+	// derived from the samples that happen to still be here.
+	SamplesFrom int       `json:"samples_from_round,omitempty"`
+	Hops        []*Hop    `json:"hops"`
+	Insights    []Insight `json:"insights,omitempty"`
 }
 
 // Hop is one TTL position on the path. In ping mode a Session has exactly one.
@@ -59,6 +65,7 @@ type Stats struct {
 	Best    float64 `json:"best_ms"`
 	Avg     float64 `json:"avg_ms"`
 	Worst   float64 `json:"worst_ms"`
+	P20     float64 `json:"p20_ms"` // the uncongested reference level
 	P50     float64 `json:"p50_ms"`
 	P95     float64 `json:"p95_ms"`
 	StdDev  float64 `json:"stddev_ms"`
@@ -130,11 +137,20 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// Recompute refreshes the derived Stats of every hop from its samples. It is
-// called on every redraw, so it must stay cheap relative to the probe interval.
+// Recompute refreshes the derived Stats of every hop from its samples.
+//
+// Statistics that already cover more probes than the samples do are left alone.
+// A long run trims its oldest samples, so recomputing there would quietly
+// replace "what this hop did all day" with "what it did in the part we kept" -
+// and the same document would then say two different things depending on whether
+// it was read by the run that made it or by a later render.
 func (s *Session) Recompute() {
 	for _, h := range s.Hops {
-		h.Stats = computeStats(h.Samples)
+		st := computeStats(h.Samples)
+		if s.SamplesFrom > 0 && h.Stats.Sent > st.Sent {
+			continue
+		}
+		h.Stats = st
 	}
 }
 
@@ -193,10 +209,17 @@ func computeStats(samples []Sample) Stats {
 	}
 	sorted := append([]float64(nil), rtts...)
 	sort.Float64s(sorted)
+	st.P20 = percentile(sorted, 20)
 	st.P50 = percentile(sorted, 50)
 	st.P95 = percentile(sorted, 95)
 	return st
 }
+
+// StatsOf summarises an arbitrary slice of samples. The live views use it for
+// the window they draw, so the short-term numbers describe exactly the probes
+// on screen and nothing else - the long-term numbers in Hop.Stats cover the
+// whole run, including probes whose samples have since been trimmed.
+func StatsOf(samples []Sample) Stats { return computeStats(samples) }
 
 // percentile is the nearest-rank percentile of an already-sorted slice.
 func percentile(sorted []float64, p float64) float64 {
@@ -217,9 +240,20 @@ func percentile(sorted []float64, p float64) float64 {
 // its replies. Comparing a sample against this - rather than against the
 // session-wide scale - is what separates "this hop is slow" from "this hop is
 // stalling right now".
+//
+// It is deliberately a whole-session figure. A baseline recomputed from the
+// visible window would drift up while the hop is stalling, and the stall would
+// then colour itself normal a minute after it started.
 func (h *Hop) Baseline() float64 {
-	rtts := make([]float64, 0, len(h.Samples))
-	for _, s := range h.Samples {
+	if h.Stats.Recv > 0 {
+		return h.Stats.P20
+	}
+	return baselineOf(h.Samples)
+}
+
+func baselineOf(samples []Sample) float64 {
+	rtts := make([]float64, 0, len(samples))
+	for _, s := range samples {
 		if !s.Lost() {
 			rtts = append(rtts, *s.RTTMS)
 		}
@@ -229,6 +263,27 @@ func (h *Hop) Baseline() float64 {
 	}
 	sort.Float64s(rtts)
 	return percentile(rtts, 20)
+}
+
+// RetainedRounds is how many trailing rounds still have samples to draw. The
+// graphs plan their columns over this rather than over Rounds, so a run whose
+// oldest probes have been trimmed does not reserve columns for them.
+func (s *Session) RetainedRounds() int {
+	n := s.Rounds - s.SamplesFrom
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// Elapsed is how long the session has been running, in milliseconds. It is the
+// span the long-term statistics cover.
+func (s *Session) Elapsed() float64 {
+	d := s.EndedAt.Sub(s.StartedAt)
+	if d < 0 {
+		return 0
+	}
+	return float64(d) / float64(time.Millisecond)
 }
 
 // MaxRTT is the largest RTT seen anywhere in the session, used to put every hop
