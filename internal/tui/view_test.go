@@ -327,8 +327,102 @@ func TestLiveTraceWindowDoesNotGrowWithTheSession(t *testing.T) {
 	if short != long {
 		t.Errorf("the graph changed shape as the run went on:\n  120 rounds: %s\n  60000 rounds: %s", short, long)
 	}
-	if !strings.HasPrefix(short, "1m of history") {
-		t.Errorf("the live window is %q, want the fixed one-minute window", short)
+	if !strings.HasSuffix(long, "1 round per column") {
+		t.Errorf("the live window is %q; at a one-second interval every round should get a column of its own", long)
+	}
+}
+
+// steady is a session whose replies repeat on a short cycle, so the sparkline is
+// a pure function of which rounds are in view - and the vertical scale, which
+// comes from the rounds drawn, is the same in every frame.
+func steady(rounds int) *model.Session {
+	s := &model.Session{
+		Tool: "puffy", Mode: "trace", Target: "test", TargetIP: "192.0.2.1",
+		StartedAt: time.Unix(0, 0), EndedAt: time.Unix(int64(rounds), 0),
+		IntervalMS: 1000, TimeoutMS: 2000, Rounds: rounds,
+	}
+	h := &model.Hop{TTL: 1, Addrs: []string{"192.0.2.1"}, Final: true}
+	// Only the tail is ever drawn, so only the tail needs to exist - which is
+	// also what the collector hands the renderer on a long run.
+	from := max(rounds-400, 0)
+	for r := from; r < rounds; r++ {
+		v := 20 + float64(r%7)*4
+		h.Samples = append(h.Samples, model.Sample{
+			Round: r, OffsetMS: float64(r) * 1000, RTTMS: &v, Addr: h.Addrs[0],
+		})
+	}
+	s.SamplesFrom = from
+	s.Hops = []*model.Hop{h}
+	s.Recompute()
+	return s
+}
+
+// sparkOf is the time series at the end of a hop row.
+func sparkOf(row string) string {
+	r := []rune(strings.TrimRight(row, " "))
+	i := len(r)
+	for i > 0 && strings.ContainsRune("▁▂▃▄▅▆▇█× ", r[i-1]) {
+		i--
+	}
+	return strings.TrimSpace(string(r[i:]))
+}
+
+// The graph has to move. A window fixed in time quietly folds ten rounds into a
+// column at a fast interval, and then the row only shifts every few seconds and
+// mostly not even then, because a column shows the worst of its rounds - which
+// is what "the graph stopped updating" looks like on a run that is drawing eight
+// frames a second.
+func TestLiveTraceGraphScrollsEveryRound(t *testing.T) {
+	for _, interval := range []time.Duration{time.Second, 250 * time.Millisecond, 50 * time.Millisecond} {
+		v := View{Screen: testScreen(t, 120, 30, true), Interval: interval}
+		// A round of the graph is however many rounds one column holds.
+		perCol := max(int(float64(liveColMS)/float64(interval.Milliseconds())), 1)
+		before := sparkOf(rowFor(v.Live(steady(60000)), 1))
+		after := sparkOf(rowFor(v.Live(steady(60000+perCol)), 1))
+		if before == "" || after == "" {
+			t.Fatalf("interval=%s: no series drawn", interval)
+		}
+		if before == after {
+			t.Errorf("interval=%s: the series did not move after %d rounds:\n  %s", interval, perCol, before)
+			continue
+		}
+		b, a := []rune(before), []rune(after)
+		if len(a) != len(b) {
+			t.Fatalf("interval=%s: the series changed width, %d then %d", interval, len(b), len(a))
+		}
+		if string(a[:len(a)-1]) != string(b[1:]) {
+			t.Errorf("interval=%s: the series did not scroll by exactly one column\n  before %s\n  after  %s",
+				interval, before, after)
+		}
+	}
+}
+
+// However fast the interval, one column may not swallow so much time that the
+// picture stands still - nor so many probes that a frame reads the whole run.
+func TestTraceWindowKeepsColumnsShortEnoughToMove(t *testing.T) {
+	const sparkW = 30
+	for _, c := range []struct {
+		intervalMS float64
+		wantPerCol int
+	}{
+		{5000, 1}, {1000, 1}, {250, 1}, {100, 3}, {50, 5}, {10, 25}, {0.5, maxLiveFold},
+	} {
+		window := traceWindow(sparkW, c.intervalMS, 0)
+		if got := window / sparkW; got != c.wantPerCol {
+			t.Errorf("at %vms a round, a column holds %d rounds, want %d", c.intervalMS, got, c.wantPerCol)
+		}
+		perCol := window / sparkW
+		switch {
+		case c.intervalMS >= liveColMS && perCol != 1:
+			t.Errorf("at %vms a round, %d rounds share a column; a round that long deserves its own",
+				c.intervalMS, perCol)
+		case perCol > 1 && perCol < maxLiveFold && float64(perCol-1)*c.intervalMS >= liveColMS:
+			t.Errorf("at %vms a round, a column holds %d rounds when %d would already be under the %dms cap",
+				c.intervalMS, perCol, perCol-1, liveColMS)
+		}
+	}
+	if got := traceWindow(sparkW, 1, 12345); got != 12345 {
+		t.Error("an explicit --window must be obeyed as given")
 	}
 }
 
@@ -404,7 +498,7 @@ func TestSummaryColumnsAreSessionScoped(t *testing.T) {
 func TestPanelsDescribeTheWindowNotTheSession(t *testing.T) {
 	v := View{Screen: testScreen(t, 120, 30, true)}
 	joined := strip(strings.Join(v.Live(synthetic(400)), "\n"))
-	if !strings.Contains(joined, "packet loss  none in the last 1m") {
+	if !strings.Contains(joined, "packet loss  none in the last ") {
 		t.Errorf("a window with no loss should say so, and say over what:\n%s", joined)
 	}
 	// And with the trouble inside the window, the panel lists the hop.
@@ -414,23 +508,53 @@ func TestPanelsDescribeTheWindowNotTheSession(t *testing.T) {
 	}
 }
 
-// A fast interval must not turn the fixed window into a frame that reads a
-// million probes: the graph cannot show more than its columns can hold.
-func TestTraceWindowIsCappedByWhatAColumnCanSay(t *testing.T) {
-	const sparkW = 30
-	if got := traceWindow(sparkW, 1000, 0); got != 60 {
-		t.Errorf("at 1s a round the window is %d rounds, want the 60 in a minute", got)
+// steadyPair is two hops on the same short cycle, the second carrying one spike
+// of spikeMS in the middle of the drawn window (0 for none).
+func steadyPair(rounds int, spikeMS float64) *model.Session {
+	s := steady(rounds)
+	h := &model.Hop{TTL: 2, Addrs: []string{"192.0.2.2"}, Final: true}
+	s.Hops[0].Final = false
+	for i, sm := range s.Hops[0].Samples {
+		v := *sm.RTTMS + 6
+		if spikeMS > 0 && i == len(s.Hops[0].Samples)-8 {
+			v = spikeMS
+		}
+		h.Samples = append(h.Samples, model.Sample{
+			Round: sm.Round, OffsetMS: sm.OffsetMS, RTTMS: &v, Addr: h.Addrs[0],
+		})
 	}
-	if got := traceWindow(sparkW, 10, 0); got != 6000 {
-		t.Errorf("at 10ms a round the window is %d rounds, want the 6000 in a minute", got)
+	s.Hops = append(s.Hops, h)
+	s.Recompute()
+	return s
+}
+
+// One spike must not flatten the picture. Scaled to the worst value drawn, a
+// two-second stall puts every ordinary column on the floor block and holds it
+// there for as long as the spike is in the window - which on a path that spikes
+// every few seconds is what "the graph stopped updating" looks like.
+func TestOneSpikeDoesNotFlattenTheOtherRows(t *testing.T) {
+	v := View{Screen: testScreen(t, 120, 30, true), Interval: time.Second}
+	calm := sparkOf(rowFor(v.Live(steadyPair(200, 0)), 1))
+	if calm == "" {
+		t.Fatal("no series drawn")
 	}
-	if got := traceWindow(sparkW, 1, 0); got != sparkW*maxLiveFold {
-		t.Errorf("at 1ms a round the window is %d rounds, want it capped at %d", got, sparkW*maxLiveFold)
+	if levels := len(distinctRunes(calm)); levels < 3 {
+		t.Fatalf("the reference row is already flat, so this test proves nothing: %s", calm)
 	}
-	if got := traceWindow(sparkW, 30000, 0); got != sparkW {
-		t.Errorf("at 30s a round the window is %d rounds, want a screenful (%d)", got, sparkW)
+	spiked := sparkOf(rowFor(v.Live(steadyPair(200, 2000)), 1))
+	if spiked != calm {
+		t.Errorf("a spike at another hop rescaled this one:\n  without %s\n  with    %s", calm, spiked)
 	}
-	if got := traceWindow(sparkW, 1, 12345); got != 12345 {
-		t.Error("an explicit --window must be obeyed as given")
+	// And the spike itself still reads as off the top of the scale.
+	if row := sparkOf(rowFor(v.Live(steadyPair(200, 2000)), 2)); !strings.ContainsRune(row, '█') {
+		t.Errorf("the spike is not drawn at full height: %s", row)
 	}
+}
+
+func distinctRunes(s string) map[rune]bool {
+	out := map[rune]bool{}
+	for _, r := range s {
+		out[r] = true
+	}
+	return out
 }

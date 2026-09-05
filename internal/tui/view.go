@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,19 +27,23 @@ type View struct {
 	Interval time.Duration
 }
 
-// liveWindowMS is how much time the live graphs show by default. Fixing the
-// window in time - rather than letting it grow to "the whole run so far" - is
-// what keeps the picture moving after six hours: a column is worth the same
-// number of rounds at minute one and at hour six, so the graph scrolls instead
-// of folding itself flat.
-const liveWindowMS = 60000
+// liveColMS is the most time one column of the live graph may hold, and it is
+// the column - not the window - that has to be bounded.
+//
+// Fixing the window at a minute instead looks right and reads wrong: at a 250ms
+// interval a minute is 240 rounds, which is ten rounds to a column, so the row
+// shifts left once every two and a half seconds, and because a column shows the
+// worst of its ten rounds the glyph usually does not change even then. The graph
+// is redrawn eight times a second and appears frozen. Capping the column at a
+// quarter-second instead means the whole row moves at least four times a second
+// at any interval, and at anything slower than that every round gets a column of
+// its own - one probe, one mark, the same rule the ping chart uses.
+const liveColMS = 250
 
-// maxLiveFold caps how many rounds the default window folds into one column.
-// Past a couple of hundred a column is a blur - worst-wins folding stops saying
-// anything new - while the frame keeps paying for every probe in it. Only an
-// interval under about 10ms reaches this; an explicit --window is obeyed as
-// given, because then the span is what the reader asked for.
-const maxLiveFold = 200
+// maxLiveFold caps the rounds per column whatever the interval, so an absurdly
+// fast one cannot ask a frame to read a hundred thousand probes. An explicit
+// --window is obeyed as given: then the span is what the reader asked for.
+const maxLiveFold = 250
 
 // WindowRounds is how many trailing rounds the next frame will draw. The caller
 // snapshots exactly this much history, so one redraw costs the window rather
@@ -63,20 +69,20 @@ func (v View) intervalMS(s *model.Session) float64 {
 	return 0
 }
 
-// traceWindow is the trace graph's default window in rounds: the last minute,
-// or a screenful of rounds when the interval is so slow that a minute would not
-// fill the width.
+// traceWindow is the trace graph's default window in rounds: one column per
+// round, or as many rounds as fit in a quarter-second column when the interval
+// is faster than that. The span it works out to is therefore the width of the
+// graph times the rate it can move at, which is the most history that can be
+// shown without the picture standing still.
 func traceWindow(sparkW int, intervalMS float64, override int) int {
 	if override > 0 {
 		return override
 	}
-	n := sparkW
-	if intervalMS > 0 {
-		if k := int(liveWindowMS / intervalMS); k > n {
-			n = min(k, sparkW*maxLiveFold)
-		}
+	perCol := 1
+	if intervalMS > 0 && intervalMS < liveColMS {
+		perCol = min(int(math.Ceil(liveColMS/intervalMS)), maxLiveFold)
 	}
-	return max(n, 1)
+	return max(sparkW*perCol, 1)
 }
 
 // pingWindow is the ping chart's window: one dot column per probe, and braille
@@ -232,9 +238,9 @@ func (v View) traceFrame(c Color, s *model.Session, cols, rows int, summary bool
 		sets = summarySets
 	}
 	lay := layoutFor(cols, sets)
-	// The live view graphs a fixed window and scrolls; the summary is allowed to
-	// fold everything it still holds into the same width, because by then the
-	// whole run is the thing being reported.
+	// The live view scrolls a window sized so that it always moves; the summary
+	// is allowed to fold everything it still holds into the same width, because
+	// by then the whole run is the thing being reported.
 	window := 0
 	if !summary {
 		window = traceWindow(lay.sparkW, v.intervalMS(s), v.Window)
@@ -293,23 +299,46 @@ func (v View) traceFrame(c Color, s *model.Session, cols, rows int, summary bool
 	return fit(out, cols, rows)
 }
 
-// scaleOf is the shared vertical scale for the sparklines: the worst RTT drawn
-// in this frame. Scaling to the whole session instead would flatten every row
-// the moment one spike landed, and that one spike would then keep the graph flat
-// for the rest of the run - a long session's series would slowly die out.
+// scaleOf is the shared vertical scale for the sparklines: the largest value
+// this frame draws that is not an outlier.
+//
+// The maximum is the usual choice and is wrong here twice over. Scaled to the
+// session's worst, one spike flattens every row for the rest of the run; scaled
+// to the window's worst, it flattens them for as long as it stays in view, and
+// on a path that spikes every few seconds that is most of the time - the graph
+// then reads as a dead row of floor blocks that never changes. A fixed
+// percentile is no better: on a path whose hops all sit near the top of the
+// range, trimming a set fraction cuts into the bulk and saturates every row
+// instead.
+//
+// So outliers are identified rather than counted, by Tukey's fence: more than
+// one and a half interquartile ranges above the upper quartile of the values
+// drawn. The scale is the largest value inside that fence - a real measurement,
+// so a full block still means a probe took that long - and the outliers draw at
+// full height too, which is what the top block already means. How far above
+// they went is in the worst column and the stall panel.
 func scaleOf(s *model.Session, cellsFor map[int][]model.Cell) float64 {
-	var m float64
+	vals := make([]float64, 0, len(cellsFor)*8)
 	for _, cells := range cellsFor {
 		for _, cell := range cells {
-			if cell.MaxRTT > m {
-				m = cell.MaxRTT
+			if cell.Empty() || cell.MaxRTT <= 0 {
+				continue
 			}
+			vals = append(vals, cell.MaxRTT)
 		}
 	}
-	if m <= 0 {
+	if len(vals) == 0 {
 		return s.MaxRTT()
 	}
-	return m
+	sort.Float64s(vals)
+	q1, q3 := model.Percentile(vals, 25), model.Percentile(vals, 75)
+	fence := q3 + 1.5*(q3-q1)
+	for i := len(vals) - 1; i >= 0; i-- {
+		if vals[i] <= fence {
+			return vals[i]
+		}
+	}
+	return vals[len(vals)-1] // unreachable: the upper quartile is inside its own fence
 }
 
 func (v View) hopRow(c Color, h *model.Hop, lay layout, cells []model.Cell, win model.Stats, scaleMax float64) string {

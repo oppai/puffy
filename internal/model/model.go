@@ -221,6 +221,11 @@ func computeStats(samples []Sample) Stats {
 // whole run, including probes whose samples have since been trimmed.
 func StatsOf(samples []Sample) Stats { return computeStats(samples) }
 
+// Percentile is the nearest-rank percentile of an already-sorted slice. It is
+// exported so the renderers can put a scale on a robust footing rather than
+// re-deriving one.
+func Percentile(sorted []float64, p float64) float64 { return percentile(sorted, p) }
+
 // percentile is the nearest-rank percentile of an already-sorted slice.
 func percentile(sorted []float64, p float64) float64 {
 	if len(sorted) == 0 {

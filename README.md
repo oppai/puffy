@@ -18,14 +18,14 @@ puffy trace 1.1.1.1  round 20 · 7s · every 350ms · timeout 2s
                         session 7s ────────────────────────────
 ttl host                   loss    last     avg    best   worst  rtt over time →
   1 192.168.40.1          40.0%     2.7     3.1     2.0     8.5  ▁▁▁▁▁▁▁▁×▁××▁××▁××▁×
-  2 42.148.76.1           40.0%    16.1    17.6    12.1    29.1  ▂▂▁▁▂▁▁▁×▂××▁××▂××▂×
-  3 10.202.98.36           0.0%    25.8    33.0    16.8   127.8  █▂▂▂▃▃▂▂▂▂▂▃▂▂▃▂▄▂▂▂
-  4 10.1.8.117             0.0%    20.4    17.1    11.3    25.9  ▂▂▂▁▂▂▁▁▂▂▂▁▁▂▁▂▂▁▁▂
-  5 175.129.17.101         0.0%    44.0    45.6    38.4    55.9  ▃▄▃▃▃▃▃▃▃▃▃▄▃▄▄▄▄▃▃▃
-  6 220.152.46.114         0.0%    41.4    39.6    34.4    50.8  ▃▃▄▃▃▃▃▃▃▄▃▃▃▃▃▃▃▃▃▃
-  7 210.173.176.127       65.0%    46.8    51.1    41.7    66.7  ××▃▃××▃××××▄×××▄▅×▃×
-  8 103.22.201.29          0.0%    38.4    40.4    27.4    59.2  ▂▃▄▃▃▃▃▃▃▂▃▃▃▃▃▄▃▃▃▃
-  9 ● 1.1.1.1              0.0%    38.8    40.0    34.6    56.2  ▃▃▃▃▃▄▃▃▃▃▃▃▃▃▃▃▃▃▃▃
+  2 42.148.76.1           40.0%    16.1    17.6    12.1    29.1  ▃▃▂▂▃▂▂▂×▃××▂××▃××▃×
+  3 10.202.98.36           0.0%    25.8    33.0    16.8   127.8  █▃▃▃▅▅▃▃▃▃▃▅▃▃▅▃▇▃▃▃
+  4 10.1.8.117             0.0%    20.4    17.1    11.3    25.9  ▃▃▃▂▃▃▂▂▃▃▃▂▂▃▂▃▃▂▂▃
+  5 175.129.17.101         0.0%    44.0    45.6    38.4    55.9  ▆▇▆▆▆▆▆▆▆▆▆▇▆▇▇▇▇▆▆▆
+  6 220.152.46.114         0.0%    41.4    39.6    34.4    50.8  ▆▆▇▆▆▆▆▆▆▇▆▆▆▆▆▆▆▆▆▆
+  7 210.173.176.127       65.0%    46.8    51.1    41.7    66.7  ××▆▆××▆××××▇×××▇█×▆×
+  8 103.22.201.29          0.0%    38.4    40.4    27.4    59.2  ▄▅▇▅▅▅▅▅▅▄▅▅▅▅▅▇▅▅▅▅
+  9 ● 1.1.1.1              0.0%    38.8    40.0    34.6    56.2  ▆▆▆▆▆▇▆▆▆▆▆▆▆▆▆▆▆▆▆▆
 
   packet loss — where it lands, and when   0% ·░▒▓█ 100%
   1 192.168.40.1        ········█·██·██·██·█
@@ -121,7 +121,7 @@ Common flags (`puffy ping --help` for the rest):
 | `-c, --count` | stop after N rounds; `0` runs until interrupted |
 | `-m, --max-ttl` | highest TTL to probe (`trace`, default 30) |
 | `--ttl` | TTL for the probes (`ping`, default 64) |
-| `--window` | rounds of history to graph; `0` uses a fixed trailing window |
+| `--window` | rounds of history to graph; `0` scrolls one column per round |
 | `--history` | rounds of raw samples to keep (default `50000`, `0` keeps every round) |
 | `--json PATH` | write the session document (`-` for stdout) |
 | `--html PATH` | write the HTML report (`-` for stdout) |
@@ -149,14 +149,20 @@ ttl host                loss    last     avg   worst     loss     avg     p95   
 That hop is fine at the moment and has not been all evening — which is the
 finding, and it is invisible in either group alone.
 
-The **graph is always a fixed window**, one minute by default, and it scrolls.
-It does not stretch to cover the whole run: a graph that keeps folding more
-rounds into every column stops moving, flattens every spike against the worst
-one of the day, and eventually costs more to draw than the run costs to measure.
-`--window` sets the window in rounds if a minute is not the span you want. (At
-an interval under about 10ms the default window is capped by what a column can
-usefully hold rather than by the minute, since past a couple of hundred rounds
-per column the picture stops changing and the frame keeps paying for them.)
+The **graph always scrolls**. By default every round gets a column of its own,
+so the row shifts left one place each time a probe lands and the window is as
+much history as the width can hold at that resolution; only an interval faster
+than a quarter-second folds rounds together, and then just enough of them to
+keep a column under a quarter-second of time. Nothing here is allowed to grow
+with the run.
+
+That last part is the whole point. Sizing the window in *time* — a fixed minute,
+say — sounds equivalent and is not: at a 250ms interval a minute is ten rounds
+to a column, so the picture shifts once every two and a half seconds, and since
+a column shows the worst of its rounds the glyph usually does not change even
+then. The graph redraws eight times a second and looks frozen. `--window` sets
+the window in rounds when you want a longer span folded in and can live with
+that.
 
 The **session** figures come from statistics folded as each probe arrives, so
 they cover the whole run exactly, however long it is and whatever the raw
@@ -165,10 +171,19 @@ session-scoped throughout, so its table has one group of columns rather than two
 
 **The hop table.** One row per TTL, one column per slice of time. Block height
 is round-trip time on a scale shared by every row, so rows are comparable at a
-glance. Colour is *state* against that hop's own baseline — normal, elevated,
-stalling — so a hop that is queueing relative to itself still stands out on a
-path where some other hop is slower in absolute terms. The two channels answer
-different questions and neither restates the other.
+glance. That scale is the largest value on screen that is *not* an
+outlier — Tukey's fence, more than one and a half interquartile ranges above
+the upper quartile of the columns drawn — rather than simply the largest.
+Scaled to the worst value, a single two-second stall puts every ordinary column
+on the floor block and holds it there for as long as it is in view, which on a
+path that spikes every few seconds is most of the time; scaled to a fixed
+percentile instead, a path whose hops all sit near the top of the range
+saturates every row. So a full block means "at or above the top of the scale",
+and how far above is in the `worst` column and the stall panel. Colour is *state* against that hop's
+own baseline — normal, elevated, stalling — so a hop that is queueing relative
+to itself still stands out on a path where some other hop is slower in absolute
+terms. The two channels answer different questions and neither restates the
+other.
 
 - `×` — every probe in that column was lost
 - a coloured block — some probes were lost, and the height still shows how slow
