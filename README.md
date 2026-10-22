@@ -78,7 +78,7 @@ Or from a checkout:
 go build -o puffy .
 ```
 
-Requires Go 1.22 or newer. There are no runtime dependencies: the HTML report
+Requires Go 1.27.3 or newer. There are no runtime dependencies: the HTML report
 embeds everything it needs and loads nothing from the network.
 
 ### Permissions
